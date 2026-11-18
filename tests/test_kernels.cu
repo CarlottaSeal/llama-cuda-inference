@@ -910,6 +910,119 @@ bool test_attention_naive() {
     return true;
 }
 
+bool test_flash_attention() {
+    printf("Testing Flash Attention (GQA)... ");
+
+    // Same params as naive test for cross-comparison
+    const int SEQ = 4, KV_LEN = 4;
+    const int NQH = 8, NKVH = 2, HD = 64;
+    const float SCALE = 1.0f / sqrtf((float)HD);
+
+    const int Q_SIZE = SEQ * NQH * HD;
+    const int KV_SIZE = KV_LEN * NKVH * HD;
+    const int O_SIZE = SEQ * NQH * HD;
+
+    std::vector<float> h_Q(Q_SIZE), h_K(KV_SIZE), h_V(KV_SIZE);
+    for (int i = 0; i < Q_SIZE; i++) h_Q[i] = ((i % 100) - 50) * 0.01f;
+    for (int i = 0; i < KV_SIZE; i++) h_K[i] = ((i % 80) - 40) * 0.01f;
+    for (int i = 0; i < KV_SIZE; i++) h_V[i] = ((i % 120) - 60) * 0.01f;
+
+    // CPU reference
+    std::vector<float> ref_O(O_SIZE);
+    cpu_attention(ref_O, h_Q, h_K, h_V, SEQ, KV_LEN, NQH, NKVH, HD, SCALE);
+
+    auto h_Q_h = to_half(h_Q);
+    auto h_K_h = to_half(h_K);
+    auto h_V_h = to_half(h_V);
+
+    half *d_Q, *d_K, *d_V, *d_O_naive, *d_O_flash;
+    CUDA_CHECK(cudaMalloc(&d_Q, Q_SIZE * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_K, KV_SIZE * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_V, KV_SIZE * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_O_naive, O_SIZE * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_O_flash, O_SIZE * sizeof(half)));
+
+    CUDA_CHECK(cudaMemcpy(d_Q, h_Q_h.data(), Q_SIZE * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_K, h_K_h.data(), KV_SIZE * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_V, h_V_h.data(), KV_SIZE * sizeof(half), cudaMemcpyHostToDevice));
+
+    launch_attention_naive(d_O_naive, d_Q, d_K, d_V, SEQ, KV_LEN, NQH, NKVH, HD, SCALE);
+    launch_flash_attention_gqa(d_O_flash, d_Q, d_K, d_V, SEQ, KV_LEN, NQH, NKVH, HD, SCALE);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> h_O_naive(O_SIZE), h_O_flash(O_SIZE);
+    CUDA_CHECK(cudaMemcpy(h_O_naive.data(), d_O_naive, O_SIZE * sizeof(half), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_O_flash.data(), d_O_flash, O_SIZE * sizeof(half), cudaMemcpyDeviceToHost));
+
+    auto r_naive = to_float(h_O_naive);
+    auto r_flash = to_float(h_O_flash);
+
+    // Cross-compare: flash should match naive
+    for (int i = 0; i < O_SIZE; i += 4) {
+        float tol = fmaxf(0.15f, fabsf(r_naive[i]) * 0.15f);
+        TEST_ASSERT(approx_equal(r_naive[i], r_flash[i], tol),
+                    "Flash vs naive attention mismatch");
+    }
+
+    // Also verify flash vs CPU
+    for (int i = 0; i < O_SIZE; i += 8) {
+        float tol = fmaxf(0.15f, fabsf(ref_O[i]) * 0.15f);
+        TEST_ASSERT(approx_equal(r_flash[i], ref_O[i], tol),
+                    "Flash vs CPU attention mismatch");
+    }
+
+    cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V);
+    cudaFree(d_O_naive); cudaFree(d_O_flash);
+
+    // Test 2: decode scenario — seq=1, kv_len=64 (simulating cache)
+    printf("\n  Subtesting decode scenario (seq=1, kv=64)... ");
+
+    const int DSEQ = 1, DKV = 64;
+    const int DQ_SIZE = DSEQ * NQH * HD;
+    const int DKV_SIZE = DKV * NKVH * HD;
+    const int DO_SIZE = DSEQ * NQH * HD;
+
+    std::vector<float> h_dQ(DQ_SIZE), h_dK(DKV_SIZE), h_dV(DKV_SIZE);
+    for (int i = 0; i < DQ_SIZE; i++) h_dQ[i] = ((i * 7) % 100 - 50) * 0.01f;
+    for (int i = 0; i < DKV_SIZE; i++) h_dK[i] = ((i * 11) % 80 - 40) * 0.01f;
+    for (int i = 0; i < DKV_SIZE; i++) h_dV[i] = ((i * 13) % 120 - 60) * 0.01f;
+
+    std::vector<float> ref_dO(DO_SIZE);
+    cpu_attention(ref_dO, h_dQ, h_dK, h_dV, DSEQ, DKV, NQH, NKVH, HD, SCALE);
+
+    auto h_dQ_h = to_half(h_dQ);
+    auto h_dK_h = to_half(h_dK);
+    auto h_dV_h = to_half(h_dV);
+
+    half *d_dQ, *d_dK, *d_dV, *d_dO;
+    CUDA_CHECK(cudaMalloc(&d_dQ, DQ_SIZE * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_dK, DKV_SIZE * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_dV, DKV_SIZE * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_dO, DO_SIZE * sizeof(half)));
+
+    CUDA_CHECK(cudaMemcpy(d_dQ, h_dQ_h.data(), DQ_SIZE * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_dK, h_dK_h.data(), DKV_SIZE * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_dV, h_dV_h.data(), DKV_SIZE * sizeof(half), cudaMemcpyHostToDevice));
+
+    launch_flash_attention_gqa(d_dO, d_dQ, d_dK, d_dV, DSEQ, DKV, NQH, NKVH, HD, SCALE);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> h_dO_out(DO_SIZE);
+    CUDA_CHECK(cudaMemcpy(h_dO_out.data(), d_dO, DO_SIZE * sizeof(half), cudaMemcpyDeviceToHost));
+    auto r_decode = to_float(h_dO_out);
+
+    for (int i = 0; i < DO_SIZE; i += 4) {
+        float tol = fmaxf(0.15f, fabsf(ref_dO[i]) * 0.15f);
+        TEST_ASSERT(approx_equal(r_decode[i], ref_dO[i], tol),
+                    "Flash attention decode mismatch");
+    }
+
+    cudaFree(d_dQ); cudaFree(d_dK); cudaFree(d_dV); cudaFree(d_dO);
+
+    printf("PASSED\n");
+    return true;
+}
+
 // ============================================================
 //  Test runner
 // ============================================================
@@ -948,6 +1061,7 @@ int main() {
 
     // M5: Attention
     run(test_attention_naive, "Attention Naive");
+    run(test_flash_attention, "Flash Attention");
 
     printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);
     return (failed > 0) ? 1 : 0;

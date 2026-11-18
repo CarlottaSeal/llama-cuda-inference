@@ -26,3 +26,4 @@ void launch_gemm_wmma(half* C, const half* A, const half* B, int M, int N, int K
 
 // --- M5: Attention ---
 void launch_attention_naive(half* out, const half* Q, const half* K, const half* V, int seq_len, int kv_len, int num_q_heads, int num_kv_heads, int head_dim, float scale);
+void launch_flash_attention_gqa(half* out, const half* Q, const half* K, const half* V, int seq_len, int kv_len, int num_q_heads, int num_kv_heads, int head_dim, float scale);
