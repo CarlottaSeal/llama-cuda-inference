@@ -12,10 +12,16 @@ set -e
 
 MODEL_DIR="${1:?Usage: $0 <model_dir> [build_dir]}"
 BUILD_DIR="${2:-build}"
-BIN="$BUILD_DIR/llama_inference"
+# Single-config generators (Make/Ninja) put the binary in build/,
+# multi-config ones (Visual Studio) in build/Release/
+BIN=""
+for c in "$BUILD_DIR/llama_inference" "$BUILD_DIR/Release/llama_inference.exe"; do
+    [ -f "$c" ] && BIN="$c" && break
+done
 
-if [ ! -f "$BIN" ]; then
-    echo "Error: $BIN not found. Build first: cd $BUILD_DIR && cmake .. && make -j"
+if [ -z "$BIN" ]; then
+    echo "Error: llama_inference not found in $BUILD_DIR. Build first:"
+    echo "  cmake -B $BUILD_DIR -DCUDA_ARCH=<sm> && cmake --build $BUILD_DIR --config Release"
     exit 1
 fi
 
