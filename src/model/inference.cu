@@ -359,7 +359,9 @@ void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start
         // 2d. RoPE on Q and K (in-place)
         launch_rope(buf_.q, buf_.kv_proj, seq_len,
                     C::num_q_heads, C::num_kv_heads, C::head_dim,
-                    start_pos, C::rope_theta);
+                    start_pos, C::rope_theta,
+                    RopeScaling{C::rope_factor, C::rope_low_freq_factor,
+                                C::rope_high_freq_factor, C::rope_original_max_pos});
 
         // 2e. Copy K to cache at [start_pos .. start_pos+seq_len)
         CUDA_CHECK(cudaMemcpy(
