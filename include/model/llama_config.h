@@ -22,6 +22,11 @@ struct LlamaConfig {
 
     // RoPE
     static constexpr float rope_theta  = 500000.0f;
+    // rope_scaling (rope_type "llama3") from config.json
+    static constexpr float rope_factor           = 32.0f;
+    static constexpr float rope_low_freq_factor  = 1.0f;
+    static constexpr float rope_high_freq_factor = 4.0f;
+    static constexpr int   rope_original_max_pos = 8192;
 
     // Normalization
     static constexpr float rms_norm_eps = 1e-5f;

@@ -17,7 +17,15 @@ void launch_rmsnorm(half* out, const half* x, const half* weight, int rows, int 
 void launch_softmax(float* x, int rows, int cols);
 
 // --- M3: RoPE ---
-void launch_rope(half* q, half* k, int seq_len, int num_q_heads, int num_kv_heads, int head_dim, int start_pos, float theta);
+// Llama 3 frequency scaling (HF rope_type "llama3"). factor = 1 leaves the
+// frequencies unchanged.
+struct RopeScaling {
+    float factor            = 1.0f;
+    float low_freq_factor   = 1.0f;
+    float high_freq_factor  = 4.0f;
+    int   original_max_pos  = 8192;
+};
+void launch_rope(half* q, half* k, int seq_len, int num_q_heads, int num_kv_heads, int head_dim, int start_pos, float theta, RopeScaling scaling = {});
 
 // --- M4: GEMM ---
 void launch_gemm_naive(half* C, const half* A, const half* B, int M, int N, int K);

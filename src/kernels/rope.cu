@@ -20,6 +20,13 @@
 //
 //  Llama 3.2: theta = 500000, head_dim = 64 → 32 pairs per head
 //
+//  Llama 3 scaling (HF _compute_llama3_parameters), with
+//  wavelen = 2π / freq, L = original_max_pos:
+//    wavelen < L / high_freq_factor  → freq unchanged
+//    wavelen > L / low_freq_factor   → freq / factor
+//    otherwise s = (L / wavelen - low) / (high - low),
+//              freq = (1 - s) * freq / factor + s * freq
+//
 //  Grid:  (seq_len, num_heads)
 //  Block: (head_dim / 2)   — 32 threads for head_dim=64
 //
@@ -28,13 +35,25 @@
 //             During decode:  start_pos=past_kv_len, pos = start_pos + token_index
 // ============================================================
 
+__device__ float llama3_scaled_freq(float freq, RopeScaling s) {
+    float wavelen = 2.0f * 3.14159265358979f / freq;
+    float low_wavelen  = s.original_max_pos / s.low_freq_factor;
+    float high_wavelen = s.original_max_pos / s.high_freq_factor;
+    if (wavelen < high_wavelen) return freq;
+    if (wavelen > low_wavelen)  return freq / s.factor;
+    float smooth = (s.original_max_pos / wavelen - s.low_freq_factor)
+                 / (s.high_freq_factor - s.low_freq_factor);
+    return (1.0f - smooth) * freq / s.factor + smooth * freq;
+}
+
 __global__ void rope_kernel(
     half* x,           // [seq_len, num_heads, head_dim], modified in-place
     int   seq_len,
     int   num_heads,
     int   head_dim,
     int   start_pos,
-    float theta
+    float theta,
+    RopeScaling scaling
 ) {
     int token = blockIdx.x;   // which token in the sequence
     int head  = blockIdx.y;   // which head
@@ -48,6 +67,7 @@ __global__ void rope_kernel(
     // Compute rotation angle
     // freq = 1 / theta^(2*pair / head_dim)
     float freq = 1.0f / powf(theta, (2.0f * pair) / (float)head_dim);
+    freq = llama3_scaled_freq(freq, scaling);
     float angle = (float)pos * freq;
     float cos_a = cosf(angle);
     float sin_a = sinf(angle);
@@ -76,15 +96,16 @@ void launch_rope(
     int num_kv_heads,
     int head_dim,
     int start_pos,
-    float theta
+    float theta,
+    RopeScaling scaling
 ) {
     int half_dim = head_dim / 2;  // threads per block = 32 for head_dim=64
 
     // Apply RoPE to Q
     dim3 grid_q(seq_len, num_q_heads);
-    rope_kernel<<<grid_q, half_dim>>>(q, seq_len, num_q_heads, head_dim, start_pos, theta);
+    rope_kernel<<<grid_q, half_dim>>>(q, seq_len, num_q_heads, head_dim, start_pos, theta, scaling);
 
     // Apply RoPE to K
     dim3 grid_k(seq_len, num_kv_heads);
-    rope_kernel<<<grid_k, half_dim>>>(k, seq_len, num_kv_heads, head_dim, start_pos, theta);
+    rope_kernel<<<grid_k, half_dim>>>(k, seq_len, num_kv_heads, head_dim, start_pos, theta, scaling);
 }

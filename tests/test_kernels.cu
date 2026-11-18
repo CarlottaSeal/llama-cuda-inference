@@ -581,6 +581,85 @@ bool test_rope() {
     cudaFree(d_dq);
     cudaFree(d_dk);
 
+    // Test 3: Llama 3 frequency scaling (factor 32, low 1, high 4, L 8192)
+    printf("\n  Subtesting llama3 rope scaling (start_pos=1000)... ");
+    {
+        const int S_SEQ = 2, S_START = 1000;
+        RopeScaling sc;
+        sc.factor = 32.0f;
+        sc.low_freq_factor = 1.0f;
+        sc.high_freq_factor = 4.0f;
+        sc.original_max_pos = 8192;
+
+        const int SQ = S_SEQ * NUM_Q_HEADS * HEAD_DIM;
+        const int SK = S_SEQ * NUM_KV_HEADS * HEAD_DIM;
+        std::vector<float> h_sq(SQ), h_sk(SK);
+        for (int i = 0; i < SQ; i++) h_sq[i] = ((i * 13) % 200 - 100) * 0.01f;
+        for (int i = 0; i < SK; i++) h_sk[i] = ((i * 17) % 150 - 75) * 0.01f;
+
+        auto h_sq_h = to_half(h_sq);
+        auto h_sk_h = to_half(h_sk);
+        half *d_sq, *d_sk;
+        CUDA_CHECK(cudaMalloc(&d_sq, SQ * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_sk, SK * sizeof(half)));
+        CUDA_CHECK(cudaMemcpy(d_sq, h_sq_h.data(), SQ * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_sk, h_sk_h.data(), SK * sizeof(half), cudaMemcpyHostToDevice));
+
+        launch_rope(d_sq, d_sk, S_SEQ, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, S_START, THETA, sc);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::vector<half> h_sq_out(SQ);
+        CUDA_CHECK(cudaMemcpy(h_sq_out.data(), d_sq, SQ * sizeof(half), cudaMemcpyDeviceToHost));
+        auto result_sq = to_float(h_sq_out);
+
+        // Reference: HF _compute_llama3_parameters, in double
+        const double PI = 3.14159265358979323846;
+        std::vector<double> inv_freq(HEAD_DIM / 2);
+        int n_unchanged = 0, n_divided = 0, n_smoothed = 0;
+        for (int p = 0; p < HEAD_DIM / 2; p++) {
+            double f = 1.0 / pow((double)THETA, 2.0 * p / HEAD_DIM);
+            double wavelen = 2.0 * PI / f;
+            double low_wl = sc.original_max_pos / sc.low_freq_factor;
+            double high_wl = sc.original_max_pos / sc.high_freq_factor;
+            if (wavelen < high_wl) {
+                n_unchanged++;
+            } else if (wavelen > low_wl) {
+                f /= sc.factor;
+                n_divided++;
+            } else {
+                double s = (sc.original_max_pos / wavelen - sc.low_freq_factor)
+                         / (sc.high_freq_factor - sc.low_freq_factor);
+                f = (1.0 - s) * f / sc.factor + s * f;
+                n_smoothed++;
+            }
+            inv_freq[p] = f;
+        }
+        // head_dim=64, theta=5e5 hits all three branches
+        TEST_ASSERT(n_unchanged > 0 && n_divided > 0 && n_smoothed > 0,
+                    "llama3 scaling test does not cover all frequency bands");
+
+        float max_err = 0.0f;
+        for (int t = 0; t < S_SEQ; t++) {
+            for (int h = 0; h < NUM_Q_HEADS; h++) {
+                long long base = (long long)t * NUM_Q_HEADS * HEAD_DIM + (long long)h * HEAD_DIM;
+                for (int p = 0; p < HEAD_DIM / 2; p++) {
+                    double a = (S_START + t) * inv_freq[p];
+                    double x0 = __half2float(h_sq_h[base + p]);
+                    double x1 = __half2float(h_sq_h[base + p + HEAD_DIM / 2]);
+                    double e0 = x0 * cos(a) - x1 * sin(a);
+                    double e1 = x0 * sin(a) + x1 * cos(a);
+                    max_err = fmaxf(max_err, fabsf(result_sq[base + p] - (float)e0));
+                    max_err = fmaxf(max_err, fabsf(result_sq[base + p + HEAD_DIM / 2] - (float)e1));
+                }
+            }
+        }
+        // FP16 storage of values in [-1.4, 1.4]: half-ulp ~ 5e-4
+        TEST_ASSERT(max_err < 2e-3f, "llama3-scaled RoPE mismatch");
+
+        cudaFree(d_sq);
+        cudaFree(d_sk);
+    }
+
     printf("PASSED\n");
     return true;
 }
