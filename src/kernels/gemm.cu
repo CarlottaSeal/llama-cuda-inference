@@ -144,6 +144,7 @@ void launch_gemm_tiled(half* C, const half* A, const half* B,
 // ============================================================
 
 #include <mma.h>
+#include <cstdint>
 using namespace nvcuda;
 
 constexpr int WMMA_M = 16;
@@ -167,9 +168,30 @@ __global__ void gemm_wmma_kernel(
     int warp_row = warp_id / warps_per_row;      // 0..3
     int warp_col = warp_id % warps_per_row;      // 0..3
 
+    int lane = threadIdx.x % 32;
+
     // Global output tile position
     int tile_row = blockIdx.y * WMMA_BLOCK_M + warp_row * WMMA_M;
     int tile_col = blockIdx.x * WMMA_BLOCK_N + warp_col * WMMA_N;
+
+    // Warp-uniform exit; the kernel has no block-level barriers
+    if (tile_row >= M || tile_col >= N) return;
+
+    // Edge tiles (M=1 in decode, ragged prefill lengths, K/N not a multiple
+    // of 16, unaligned base pointers) go through per-warp shared memory,
+    // zero-padded on load and masked on store. Full tiles read/write global
+    // directly.
+    constexpr int TILE_ELEMS = WMMA_M * WMMA_K;
+    constexpr int WARPS = (WMMA_BLOCK_M / WMMA_M) * (WMMA_BLOCK_N / WMMA_N);
+    __shared__ half  sA[WARPS][TILE_ELEMS];
+    __shared__ half  sB[WARPS][TILE_ELEMS];
+    __shared__ float sC[WARPS][WMMA_M * WMMA_N];
+
+    bool rows_full = tile_row + WMMA_M <= M;
+    bool cols_full = tile_col + WMMA_N <= N;
+    bool a_direct = rows_full && K % 16 == 0 && (uintptr_t)A % 32 == 0;
+    bool b_direct = cols_full && K % 16 == 0 && N % 16 == 0 && (uintptr_t)B % 32 == 0;
+    bool c_direct = rows_full && cols_full && N % 16 == 0 && (uintptr_t)C % 32 == 0;
 
     // Declare wmma fragments
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
@@ -180,31 +202,50 @@ __global__ void gemm_wmma_kernel(
 
     // Loop over K in steps of WMMA_K=16
     for (int k = 0; k < K; k += WMMA_K) {
-        // Bounds check: only load if within matrix dimensions
-        if (tile_row < M && k < K) {
-            // Load A fragment: A[tile_row : tile_row+16, k : k+16]
-            // Leading dimension of A is K (row-major)
+        // A fragment: A[tile_row : tile_row+16, k : k+16], leading dim K
+        if (a_direct) {
             wmma::load_matrix_sync(a_frag, A + tile_row * K + k, K);
+        } else {
+            for (int i = lane; i < TILE_ELEMS; i += 32) {
+                int r = tile_row + i / WMMA_K, c = k + i % WMMA_K;
+                sA[warp_id][i] = (r < M && c < K) ? A[r * K + c] : __float2half(0.0f);
+            }
+            __syncwarp();
+            wmma::load_matrix_sync(a_frag, sA[warp_id], WMMA_K);
         }
 
-        if (k < K && tile_col < N) {
-            // Load B fragment: B[k : k+16, tile_col : tile_col+16]
-            // Leading dimension of B is N (row-major)
+        // B fragment: B[k : k+16, tile_col : tile_col+16], leading dim N
+        if (b_direct) {
             wmma::load_matrix_sync(b_frag, B + k * N + tile_col, N);
+        } else {
+            for (int i = lane; i < TILE_ELEMS; i += 32) {
+                int r = k + i / WMMA_N, c = tile_col + i % WMMA_N;
+                sB[warp_id][i] = (r < K && c < N) ? B[r * N + c] : __float2half(0.0f);
+            }
+            __syncwarp();
+            wmma::load_matrix_sync(b_frag, sB[warp_id], WMMA_N);
         }
 
         // Matrix multiply-accumulate
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        __syncwarp();  // staging buffers are rewritten next iteration
     }
 
     // Store result as FP16
-    if (tile_row < M && tile_col < N) {
+    if (c_direct) {
         // Convert FP32 accumulator to FP16 output
         wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_half_frag;
         for (int i = 0; i < c_frag.num_elements; i++) {
             c_half_frag.x[i] = __float2half(c_frag.x[i]);
         }
         wmma::store_matrix_sync(C + tile_row * N + tile_col, c_half_frag, N, wmma::mem_row_major);
+    } else {
+        wmma::store_matrix_sync(sC[warp_id], c_frag, WMMA_N, wmma::mem_row_major);
+        __syncwarp();
+        for (int i = lane; i < WMMA_M * WMMA_N; i += 32) {
+            int r = tile_row + i / WMMA_N, c = tile_col + i % WMMA_N;
+            if (r < M && c < N) C[r * N + c] = __float2half(sC[warp_id][i]);
+        }
     }
 }
 

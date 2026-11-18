@@ -791,6 +791,53 @@ bool test_gemm_realistic() {
     return true;
 }
 
+bool test_gemm_wmma_edges() {
+    printf("Testing GEMM wmma edge tiles... ");
+
+    // Decode (M=1), q/kv projection widths, and a fully ragged shape.
+    // C is allocated at exactly M*N so compute-sanitizer flags any overrun.
+    const int shapes[][3] = {
+        {1, 2048, 2048},
+        {1, 512, 2048},
+        {7, 2048, 2048},
+        {37, 50, 72},
+    };
+
+    for (const auto& s : shapes) {
+        int M = s[0], N = s[1], K = s[2];
+
+        std::vector<float> h_A(M * K), h_B(K * N);
+        for (int i = 0; i < M * K; i++) h_A[i] = ((i * 7 + 3) % 200 - 100) * 0.005f;
+        for (int i = 0; i < K * N; i++) h_B[i] = ((i * 11 + 5) % 200 - 100) * 0.005f;
+
+        std::vector<float> ref_C(M * N);
+        cpu_gemm(h_A, h_B, ref_C, M, N, K);
+
+        auto h_A_h = to_half(h_A);
+        auto h_B_h = to_half(h_B);
+
+        half *d_A, *d_B, *d_C;
+        CUDA_CHECK(cudaMalloc(&d_A, M * K * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_B, K * N * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_C, M * N * sizeof(half)));
+        CUDA_CHECK(cudaMemcpy(d_A, h_A_h.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_B, h_B_h.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
+
+        launch_gemm_wmma(d_C, d_A, d_B, M, N, K);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::vector<half> h_C(M * N);
+        CUDA_CHECK(cudaMemcpy(h_C.data(), d_C, M * N * sizeof(half), cudaMemcpyDeviceToHost));
+
+        bool ok = verify_gemm(to_float(h_C), ref_C, M, N, "wmma edge");
+        cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+        TEST_ASSERT(ok, "wmma GEMM edge-tile mismatch");
+    }
+
+    printf("PASSED\n");
+    return true;
+}
+
 // ============================================================
 //  M5 Tests: Attention
 // ============================================================
@@ -1058,6 +1105,7 @@ int main() {
     run(test_gemm_tiled,     "GEMM Tiled");
     run(test_gemm_wmma,      "GEMM wmma");
     run(test_gemm_realistic, "GEMM Realistic");
+    run(test_gemm_wmma_edges, "GEMM wmma edges");
 
     // M5: Attention
     run(test_attention_naive, "Attention Naive");
