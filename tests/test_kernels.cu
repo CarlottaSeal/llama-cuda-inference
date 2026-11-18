@@ -792,6 +792,125 @@ bool test_gemm_realistic() {
 }
 
 // ============================================================
+//  M5 Tests: Attention
+// ============================================================
+
+// CPU reference attention with GQA and causal mask
+static void cpu_attention(
+    std::vector<float>& O,
+    const std::vector<float>& Q,
+    const std::vector<float>& K,
+    const std::vector<float>& V,
+    int seq_len, int kv_len,
+    int num_q_heads, int num_kv_heads,
+    int head_dim, float scale
+) {
+    int gqa_ratio = num_q_heads / num_kv_heads;
+
+    for (int q_idx = 0; q_idx < seq_len; q_idx++) {
+        int q_abs_pos = kv_len - seq_len + q_idx;
+        for (int qh = 0; qh < num_q_heads; qh++) {
+            int kv_head = qh / gqa_ratio;
+
+            // Compute scores
+            std::vector<float> scores(kv_len);
+            float max_s = -FLT_MAX;
+            for (int k_idx = 0; k_idx < kv_len; k_idx++) {
+                if (k_idx <= q_abs_pos) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; d++) {
+                        float q_val = Q[(long long)q_idx * num_q_heads * head_dim + qh * head_dim + d];
+                        float k_val = K[(long long)k_idx * num_kv_heads * head_dim + kv_head * head_dim + d];
+                        dot += q_val * k_val;
+                    }
+                    scores[k_idx] = dot * scale;
+                } else {
+                    scores[k_idx] = -FLT_MAX;
+                }
+                max_s = fmaxf(max_s, scores[k_idx]);
+            }
+
+            // Softmax
+            float sum_exp = 0.0f;
+            for (int k_idx = 0; k_idx < kv_len; k_idx++) {
+                scores[k_idx] = expf(scores[k_idx] - max_s);
+                sum_exp += scores[k_idx];
+            }
+            for (int k_idx = 0; k_idx < kv_len; k_idx++) {
+                scores[k_idx] /= sum_exp;
+            }
+
+            // Weighted sum of V
+            for (int d = 0; d < head_dim; d++) {
+                float acc = 0.0f;
+                for (int k_idx = 0; k_idx < kv_len; k_idx++) {
+                    float v_val = V[(long long)k_idx * num_kv_heads * head_dim + kv_head * head_dim + d];
+                    acc += scores[k_idx] * v_val;
+                }
+                O[(long long)q_idx * num_q_heads * head_dim + qh * head_dim + d] = acc;
+            }
+        }
+    }
+}
+
+bool test_attention_naive() {
+    printf("Testing Naive Attention (GQA)... ");
+
+    // Small test: seq=4, kv=4 (prefill, no cache), 8 Q heads, 2 KV heads, head_dim=64
+    const int SEQ = 4, KV_LEN = 4;
+    const int NQH = 8, NKVH = 2, HD = 64;
+    const float SCALE = 1.0f / sqrtf((float)HD);
+
+    const int Q_SIZE = SEQ * NQH * HD;
+    const int KV_SIZE = KV_LEN * NKVH * HD;
+    const int O_SIZE = SEQ * NQH * HD;
+
+    std::vector<float> h_Q(Q_SIZE), h_K(KV_SIZE), h_V(KV_SIZE);
+    for (int i = 0; i < Q_SIZE; i++) h_Q[i] = ((i % 100) - 50) * 0.01f;
+    for (int i = 0; i < KV_SIZE; i++) h_K[i] = ((i % 80) - 40) * 0.01f;
+    for (int i = 0; i < KV_SIZE; i++) h_V[i] = ((i % 120) - 60) * 0.01f;
+
+    // CPU reference
+    std::vector<float> ref_O(O_SIZE);
+    cpu_attention(ref_O, h_Q, h_K, h_V, SEQ, KV_LEN, NQH, NKVH, HD, SCALE);
+
+    auto h_Q_h = to_half(h_Q);
+    auto h_K_h = to_half(h_K);
+    auto h_V_h = to_half(h_V);
+
+    half *d_Q, *d_K, *d_V, *d_O;
+    CUDA_CHECK(cudaMalloc(&d_Q, Q_SIZE * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_K, KV_SIZE * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_V, KV_SIZE * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_O, O_SIZE * sizeof(half)));
+
+    CUDA_CHECK(cudaMemcpy(d_Q, h_Q_h.data(), Q_SIZE * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_K, h_K_h.data(), KV_SIZE * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_V, h_V_h.data(), KV_SIZE * sizeof(half), cudaMemcpyHostToDevice));
+
+    launch_attention_naive(d_O, d_Q, d_K, d_V, SEQ, KV_LEN, NQH, NKVH, HD, SCALE);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> h_O(O_SIZE);
+    CUDA_CHECK(cudaMemcpy(h_O.data(), d_O, O_SIZE * sizeof(half), cudaMemcpyDeviceToHost));
+    auto result = to_float(h_O);
+
+    // Verify against CPU reference
+    for (int i = 0; i < O_SIZE; i += 8) {
+        float tol = fmaxf(0.1f, fabsf(ref_O[i]) * 0.1f);
+        TEST_ASSERT(approx_equal(result[i], ref_O[i], tol), "Naive attention mismatch");
+    }
+
+    // Verify causal mask: first query should only attend to first KV position
+    // (output should be exactly V[0] for the first Q's attention)
+    // This is a weak check — the detailed comparison above is the real test
+
+    cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O);
+    printf("PASSED\n");
+    return true;
+}
+
+// ============================================================
 //  Test runner
 // ============================================================
 
@@ -826,6 +945,9 @@ int main() {
     run(test_gemm_tiled,     "GEMM Tiled");
     run(test_gemm_wmma,      "GEMM wmma");
     run(test_gemm_realistic, "GEMM Realistic");
+
+    // M5: Attention
+    run(test_attention_naive, "Attention Naive");
 
     printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);
     return (failed > 0) ? 1 : 0;

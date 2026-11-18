@@ -31,6 +31,8 @@ set(KERNEL_SOURCES
     src/kernels/rope.cu
     # M4: GEMM
     src/kernels/gemm.cu
+    # M5: Attention
+    src/kernels/attention.cu
 )
 
 add_library(llama_kernels STATIC ${KERNEL_SOURCES})
