@@ -29,6 +29,8 @@ set(KERNEL_SOURCES
     src/kernels/softmax.cu
     # M3: RoPE
     src/kernels/rope.cu
+    # M4: GEMM
+    src/kernels/gemm.cu
 )
 
 add_library(llama_kernels STATIC ${KERNEL_SOURCES})

@@ -585,6 +585,82 @@ bool test_rope() {
 }
 
 // ============================================================
+//  M4 Tests: GEMM
+// ============================================================
+
+// CPU reference GEMM for correctness verification
+static void cpu_gemm(const std::vector<float>& A, const std::vector<float>& B,
+                     std::vector<float>& C, int M, int N, int K) {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++) {
+                acc += A[i * K + k] * B[k * N + j];
+            }
+            C[i * N + j] = acc;
+        }
+    }
+}
+
+// Helper: verify GEMM result against CPU reference
+static bool verify_gemm(const std::vector<float>& result,
+                         const std::vector<float>& ref,
+                         int M, int N, const char* name) {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            float got = result[i * N + j];
+            float exp = ref[i * N + j];
+            // FP16 accumulation tolerance: relative + absolute
+            float tol = fmaxf(0.5f, fabsf(exp) * 0.05f);
+            if (!approx_equal(got, exp, tol)) {
+                fprintf(stderr, "  %s mismatch at [%d][%d]: got %f, expected %f\n",
+                        name, i, j, got, exp);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool test_gemm_naive() {
+    printf("Testing GEMM Naive... ");
+
+    // Small test: 64×128 × 128×96 = 64×96
+    const int M = 64, N = 96, K = 128;
+
+    std::vector<float> h_A(M * K), h_B(K * N);
+    for (int i = 0; i < M * K; i++) h_A[i] = ((i % 200) - 100) * 0.01f;
+    for (int i = 0; i < K * N; i++) h_B[i] = ((i % 150) - 75) * 0.01f;
+
+    std::vector<float> ref_C(M * N);
+    cpu_gemm(h_A, h_B, ref_C, M, N, K);
+
+    auto h_A_h = to_half(h_A);
+    auto h_B_h = to_half(h_B);
+
+    half *d_A, *d_B, *d_C;
+    CUDA_CHECK(cudaMalloc(&d_A, M * K * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_B, K * N * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_C, M * N * sizeof(half)));
+    CUDA_CHECK(cudaMemcpy(d_A, h_A_h.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, h_B_h.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
+
+    launch_gemm_naive(d_C, d_A, d_B, M, N, K);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> h_C(M * N);
+    CUDA_CHECK(cudaMemcpy(h_C.data(), d_C, M * N * sizeof(half), cudaMemcpyDeviceToHost));
+    auto result = to_float(h_C);
+
+    bool ok = verify_gemm(result, ref_C, M, N, "naive");
+    TEST_ASSERT(ok, "Naive GEMM failed verification");
+
+    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+    printf("PASSED\n");
+    return true;
+}
+
+// ============================================================
 //  Test runner
 // ============================================================
 
@@ -613,6 +689,9 @@ int main() {
 
     // M3: RoPE
     run(test_rope,     "RoPE");
+
+    // M4: GEMM
+    run(test_gemm_naive,     "GEMM Naive");
 
     printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);
     return (failed > 0) ? 1 : 0;
