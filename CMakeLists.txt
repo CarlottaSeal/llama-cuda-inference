@@ -22,6 +22,7 @@ set(MODEL_SOURCES
     src/model/safetensors.cpp
     src/model/weight_loader.cpp
     src/model/tokenizer.cpp
+    src/model/inference.cu
 )
 add_library(llama_model STATIC ${MODEL_SOURCES})
 target_compile_options(llama_model PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
@@ -49,6 +50,10 @@ set(KERNEL_SOURCES
 
 add_library(llama_kernels STATIC ${KERNEL_SOURCES})
 target_compile_options(llama_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+
+# inference.cu calls the kernel launchers; declaring the dependency lets CMake
+# order the static libs correctly for single-pass linkers (GNU ld)
+target_link_libraries(llama_model PUBLIC llama_kernels)
 
 # ---- Main executable ----
 add_executable(llama_inference src/main.cu)
