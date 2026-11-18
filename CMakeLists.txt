@@ -27,6 +27,8 @@ set(KERNEL_SOURCES
     # M2: reduction kernels
     src/kernels/rmsnorm.cu
     src/kernels/softmax.cu
+    # M3: RoPE
+    src/kernels/rope.cu
 )
 
 add_library(llama_kernels STATIC ${KERNEL_SOURCES})

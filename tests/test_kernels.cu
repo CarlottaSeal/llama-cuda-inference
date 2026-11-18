@@ -397,6 +397,194 @@ bool test_softmax() {
 }
 
 // ============================================================
+//  M3 Tests: RoPE
+// ============================================================
+
+bool test_rope() {
+    printf("Testing RoPE... ");
+
+    // Llama 3.2 1B params
+    const int SEQ_LEN = 4;
+    const int NUM_Q_HEADS = 32;
+    const int NUM_KV_HEADS = 8;
+    const int HEAD_DIM = 64;
+    const float THETA = 500000.0f;
+    const int START_POS = 0;
+
+    const int Q_SIZE = SEQ_LEN * NUM_Q_HEADS * HEAD_DIM;
+    const int K_SIZE = SEQ_LEN * NUM_KV_HEADS * HEAD_DIM;
+
+    // Fill Q and K with recognizable values
+    std::vector<float> h_q(Q_SIZE), h_k(K_SIZE);
+    for (int i = 0; i < Q_SIZE; i++) {
+        h_q[i] = ((i % 200) - 100) * 0.01f;
+    }
+    for (int i = 0; i < K_SIZE; i++) {
+        h_k[i] = ((i % 150) - 75) * 0.01f;
+    }
+
+    // Keep a copy for CPU reference
+    std::vector<float> ref_q = h_q;
+    std::vector<float> ref_k = h_k;
+
+    auto h_q_h = to_half(h_q);
+    auto h_k_h = to_half(h_k);
+
+    half *d_q, *d_k;
+    CUDA_CHECK(cudaMalloc(&d_q, Q_SIZE * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_k, K_SIZE * sizeof(half)));
+    CUDA_CHECK(cudaMemcpy(d_q, h_q_h.data(), Q_SIZE * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k, h_k_h.data(), K_SIZE * sizeof(half), cudaMemcpyHostToDevice));
+
+    launch_rope(d_q, d_k, SEQ_LEN, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, START_POS, THETA);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> h_q_out(Q_SIZE), h_k_out(K_SIZE);
+    CUDA_CHECK(cudaMemcpy(h_q_out.data(), d_q, Q_SIZE * sizeof(half), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_k_out.data(), d_k, K_SIZE * sizeof(half), cudaMemcpyDeviceToHost));
+
+    auto result_q = to_float(h_q_out);
+    auto result_k = to_float(h_k_out);
+
+    // CPU reference RoPE
+    auto cpu_rope = [&](std::vector<float>& x, int num_heads, int start_pos) {
+        for (int t = 0; t < SEQ_LEN; t++) {
+            int pos = start_pos + t;
+            for (int h = 0; h < num_heads; h++) {
+                for (int p = 0; p < HEAD_DIM / 2; p++) {
+                    float freq = 1.0f / powf(THETA, (2.0f * p) / (float)HEAD_DIM);
+                    float angle = (float)pos * freq;
+                    float cos_a = cosf(angle);
+                    float sin_a = sinf(angle);
+
+                    long long off = (long long)t * num_heads * HEAD_DIM
+                                  + (long long)h * HEAD_DIM + 2 * p;
+                    float x0 = x[off];
+                    float x1 = x[off + 1];
+                    x[off]     = x0 * cos_a - x1 * sin_a;
+                    x[off + 1] = x0 * sin_a + x1 * cos_a;
+                }
+            }
+        }
+    };
+
+    cpu_rope(ref_q, NUM_Q_HEADS, START_POS);
+    cpu_rope(ref_k, NUM_KV_HEADS, START_POS);
+
+    // Verify Q (spot check every 4th head, every pair)
+    for (int t = 0; t < SEQ_LEN; t++) {
+        for (int h = 0; h < NUM_Q_HEADS; h += 4) {
+            for (int d = 0; d < HEAD_DIM; d++) {
+                long long idx = (long long)t * NUM_Q_HEADS * HEAD_DIM + h * HEAD_DIM + d;
+                float tol = fmaxf(0.05f, fabsf(ref_q[idx]) * 0.05f);
+                TEST_ASSERT(approx_equal(result_q[idx], ref_q[idx], tol),
+                            "RoPE Q mismatch");
+            }
+        }
+    }
+
+    // Verify K (all heads — only 8)
+    for (int t = 0; t < SEQ_LEN; t++) {
+        for (int h = 0; h < NUM_KV_HEADS; h++) {
+            for (int d = 0; d < HEAD_DIM; d++) {
+                long long idx = (long long)t * NUM_KV_HEADS * HEAD_DIM + h * HEAD_DIM + d;
+                float tol = fmaxf(0.05f, fabsf(ref_k[idx]) * 0.05f);
+                TEST_ASSERT(approx_equal(result_k[idx], ref_k[idx], tol),
+                            "RoPE K mismatch");
+            }
+        }
+    }
+
+    // Property: RoPE preserves vector magnitude (rotation is unitary)
+    for (int t = 0; t < SEQ_LEN; t++) {
+        for (int h = 0; h < NUM_Q_HEADS; h += 8) {
+            float mag_before = 0.0f, mag_after = 0.0f;
+            long long base = (long long)t * NUM_Q_HEADS * HEAD_DIM + h * HEAD_DIM;
+            for (int d = 0; d < HEAD_DIM; d++) {
+                mag_before += h_q[base + d] * h_q[base + d];
+                mag_after  += result_q[base + d] * result_q[base + d];
+            }
+            mag_before = sqrtf(mag_before);
+            mag_after = sqrtf(mag_after);
+            float tol = fmaxf(0.1f, mag_before * 0.05f);
+            TEST_ASSERT(approx_equal(mag_before, mag_after, tol),
+                        "RoPE doesn't preserve magnitude");
+        }
+    }
+
+    cudaFree(d_q);
+    cudaFree(d_k);
+
+    // Test 2: with start_pos > 0 (decode phase)
+    printf("\n  Subtesting decode phase (start_pos=128)... ");
+
+    const int DECODE_SEQ = 1;  // single token in decode
+    const int DECODE_START = 128;
+    const int DQ_SIZE = DECODE_SEQ * NUM_Q_HEADS * HEAD_DIM;
+    const int DK_SIZE = DECODE_SEQ * NUM_KV_HEADS * HEAD_DIM;
+
+    std::vector<float> h_dq(DQ_SIZE), h_dk(DK_SIZE);
+    for (int i = 0; i < DQ_SIZE; i++) h_dq[i] = 0.5f;
+    for (int i = 0; i < DK_SIZE; i++) h_dk[i] = 0.3f;
+
+    std::vector<float> ref_dq = h_dq, ref_dk = h_dk;
+
+    auto h_dq_h = to_half(h_dq);
+    auto h_dk_h = to_half(h_dk);
+
+    half *d_dq, *d_dk;
+    CUDA_CHECK(cudaMalloc(&d_dq, DQ_SIZE * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_dk, DK_SIZE * sizeof(half)));
+    CUDA_CHECK(cudaMemcpy(d_dq, h_dq_h.data(), DQ_SIZE * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_dk, h_dk_h.data(), DK_SIZE * sizeof(half), cudaMemcpyHostToDevice));
+
+    launch_rope(d_dq, d_dk, DECODE_SEQ, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, DECODE_START, THETA);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> h_dq_out(DQ_SIZE);
+    CUDA_CHECK(cudaMemcpy(h_dq_out.data(), d_dq, DQ_SIZE * sizeof(half), cudaMemcpyDeviceToHost));
+    auto result_dq = to_float(h_dq_out);
+
+    // CPU reference with start_pos=128
+    cpu_rope(ref_dq, NUM_Q_HEADS, DECODE_START);
+
+    for (int h = 0; h < NUM_Q_HEADS; h += 8) {
+        for (int d = 0; d < HEAD_DIM; d++) {
+            long long idx = h * HEAD_DIM + d;
+            float tol = fmaxf(0.05f, fabsf(ref_dq[idx]) * 0.05f);
+            TEST_ASSERT(approx_equal(result_dq[idx], ref_dq[idx], tol),
+                        "RoPE decode-phase mismatch");
+        }
+    }
+
+    // Verify position 128 gives different result than position 0
+    // (at least for the low-frequency pairs)
+    {
+        // head 0, pair 0 — lowest frequency, still should rotate differently at pos=128
+        float val_pos0_d0 = ref_q[0];  // from first test: pos=0, head=0, dim=0
+        float val_pos128_d0 = ref_dq[0]; // pos=128, head=0, dim=0
+        // They had different inputs so we can't compare directly,
+        // but we can verify the decode result isn't identical to the input
+        bool changed = false;
+        for (int d = 0; d < HEAD_DIM; d++) {
+            if (fabsf(result_dq[d] - 0.5f) > 0.01f) {
+                changed = true;
+                break;
+            }
+        }
+        // At pos=128, the rotation angles are non-trivial, so values should change
+        // (input was uniform 0.5, output should differ for most dimensions)
+        TEST_ASSERT(changed, "RoPE decode result unchanged from input");
+    }
+
+    cudaFree(d_dq);
+    cudaFree(d_dk);
+
+    printf("PASSED\n");
+    return true;
+}
+
+// ============================================================
 //  Test runner
 // ============================================================
 
@@ -422,6 +610,9 @@ int main() {
     // M2: Reduction
     run(test_rmsnorm,  "RMSNorm");
     run(test_softmax,  "Softmax");
+
+    // M3: RoPE
+    run(test_rope,     "RoPE");
 
     printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);
     return (failed > 0) ? 1 : 0;
