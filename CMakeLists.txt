@@ -22,6 +22,7 @@ include_directories(${PROJECT_SOURCE_DIR}/include)
 set(KERNEL_SOURCES
     # M1: element-wise kernels
     src/kernels/residual.cu
+    src/kernels/silu.cu
 )
 
 add_library(llama_kernels STATIC ${KERNEL_SOURCES})
