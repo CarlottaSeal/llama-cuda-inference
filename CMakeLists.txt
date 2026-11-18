@@ -17,6 +17,17 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math")
 # ---- Include paths ----
 include_directories(${PROJECT_SOURCE_DIR}/include)
 
+# ---- Model library (C++ sources for safetensors, tokenizer, etc.) ----
+set(MODEL_SOURCES
+    src/model/safetensors.cpp
+    src/model/weight_loader.cpp
+)
+add_library(llama_model STATIC ${MODEL_SOURCES})
+target_compile_options(llama_model PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+# .cpp sources include cuda_runtime.h; the host compiler needs the toolkit headers
+find_package(CUDAToolkit REQUIRED)
+target_include_directories(llama_model PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+
 # ---- Kernel library (static) ----
 # Files added incrementally per milestone
 set(KERNEL_SOURCES
@@ -40,7 +51,7 @@ target_compile_options(llama_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-r
 
 # ---- Main executable ----
 add_executable(llama_inference src/main.cu)
-target_link_libraries(llama_inference llama_kernels)
+target_link_libraries(llama_inference llama_kernels llama_model)
 
 # ---- Test executable ----
 add_executable(test_kernels tests/test_kernels.cu)
