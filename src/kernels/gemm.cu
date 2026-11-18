@@ -125,3 +125,94 @@ void launch_gemm_tiled(half* C, const half* A, const half* B,
     gemm_tiled_kernel<<<grid, block>>>(C, A, B, M, N, K);
 }
 
+// ============================================================
+//  4c: wmma Tensor Core GEMM
+//
+//  Uses nvcuda::wmma API for 16×16×16 matrix multiply-accumulate.
+//  A warp (32 threads) cooperates on one 16×16 output tile.
+//
+//  Each warp:
+//    - Loads 16×16 fragment of A (row_major, FP16)
+//    - Loads 16×16 fragment of B (row_major, FP16)
+//    - MMA accumulates into 16×16 fragment of C (FP32)
+//    - Stores result as FP16
+//
+//  Block layout: (WMMA_BLOCK_N/16, WMMA_BLOCK_M/16) warps per block
+//  where each warp handles one 16×16 output tile.
+//
+//  Grid: covers the full M×N output.
+// ============================================================
+
+#include <mma.h>
+using namespace nvcuda;
+
+constexpr int WMMA_M = 16;
+constexpr int WMMA_N = 16;
+constexpr int WMMA_K = 16;
+
+// Block-level tiling: how many wmma tiles per block
+constexpr int WMMA_BLOCK_M = 64;  // 4 wmma tiles in M
+constexpr int WMMA_BLOCK_N = 64;  // 4 wmma tiles in N
+// Warps per block: (64/16) × (64/16) = 4×4 = 16 warps = 512 threads
+
+__global__ void gemm_wmma_kernel(
+    half*       C,
+    const half* A,
+    const half* B,
+    int M, int N, int K
+) {
+    // Which wmma tile this warp is responsible for
+    int warp_id = (threadIdx.y * blockDim.x + threadIdx.x) / 32;
+    int warps_per_row = WMMA_BLOCK_N / WMMA_N;  // 4
+    int warp_row = warp_id / warps_per_row;      // 0..3
+    int warp_col = warp_id % warps_per_row;      // 0..3
+
+    // Global output tile position
+    int tile_row = blockIdx.y * WMMA_BLOCK_M + warp_row * WMMA_M;
+    int tile_col = blockIdx.x * WMMA_BLOCK_N + warp_col * WMMA_N;
+
+    // Declare wmma fragments
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    // Loop over K in steps of WMMA_K=16
+    for (int k = 0; k < K; k += WMMA_K) {
+        // Bounds check: only load if within matrix dimensions
+        if (tile_row < M && k < K) {
+            // Load A fragment: A[tile_row : tile_row+16, k : k+16]
+            // Leading dimension of A is K (row-major)
+            wmma::load_matrix_sync(a_frag, A + tile_row * K + k, K);
+        }
+
+        if (k < K && tile_col < N) {
+            // Load B fragment: B[k : k+16, tile_col : tile_col+16]
+            // Leading dimension of B is N (row-major)
+            wmma::load_matrix_sync(b_frag, B + k * N + tile_col, N);
+        }
+
+        // Matrix multiply-accumulate
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    // Store result as FP16
+    if (tile_row < M && tile_col < N) {
+        // Convert FP32 accumulator to FP16 output
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_half_frag;
+        for (int i = 0; i < c_frag.num_elements; i++) {
+            c_half_frag.x[i] = __float2half(c_frag.x[i]);
+        }
+        wmma::store_matrix_sync(C + tile_row * N + tile_col, c_half_frag, N, wmma::mem_row_major);
+    }
+}
+
+void launch_gemm_wmma(half* C, const half* A, const half* B,
+                       int M, int N, int K) {
+    // Block: 16 warps (512 threads), arranged as a flat 1D block
+    // Each warp handles one 16×16 tile
+    dim3 block(512);
+    dim3 grid(cdiv(N, WMMA_BLOCK_N), cdiv(M, WMMA_BLOCK_M));
+    gemm_wmma_kernel<<<grid, block>>>(C, A, B, M, N, K);
+}

@@ -698,6 +698,99 @@ bool test_gemm_tiled() {
     return true;
 }
 
+bool test_gemm_wmma() {
+    printf("Testing GEMM wmma... ");
+
+    // Must be 16-aligned for wmma; use realistic Llama sizes
+    // QKV projection: seq_len=16 × hidden=2048 → 16×2048 × 2048×2048
+    // Use smaller for quick test: 32×64 × 64×48
+    const int M = 32, N = 48, K = 64;
+
+    std::vector<float> h_A(M * K), h_B(K * N);
+    for (int i = 0; i < M * K; i++) h_A[i] = ((i % 200) - 100) * 0.01f;
+    for (int i = 0; i < K * N; i++) h_B[i] = ((i % 150) - 75) * 0.01f;
+
+    std::vector<float> ref_C(M * N);
+    cpu_gemm(h_A, h_B, ref_C, M, N, K);
+
+    auto h_A_h = to_half(h_A);
+    auto h_B_h = to_half(h_B);
+
+    half *d_A, *d_B, *d_C;
+    CUDA_CHECK(cudaMalloc(&d_A, M * K * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_B, K * N * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_C, M * N * sizeof(half)));
+    CUDA_CHECK(cudaMemcpy(d_A, h_A_h.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, h_B_h.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
+
+    launch_gemm_wmma(d_C, d_A, d_B, M, N, K);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> h_C(M * N);
+    CUDA_CHECK(cudaMemcpy(h_C.data(), d_C, M * N * sizeof(half), cudaMemcpyDeviceToHost));
+    auto result = to_float(h_C);
+
+    bool ok = verify_gemm(result, ref_C, M, N, "wmma");
+    TEST_ASSERT(ok, "wmma GEMM failed verification");
+
+    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+    printf("PASSED\n");
+    return true;
+}
+
+bool test_gemm_realistic() {
+    printf("Testing GEMM realistic sizes (Llama linear projection)... ");
+
+    // Llama 3.2 1B: hidden=2048, intermediate=8192
+    // QKV projection: [seq, 2048] × [2048, 2048] (simplified)
+    // Use seq=8 to keep test fast
+    const int M = 8, N = 2048, K = 2048;
+
+    std::vector<float> h_A(M * K), h_B(K * N);
+    for (int i = 0; i < M * K; i++) h_A[i] = ((i * 7 + 3) % 200 - 100) * 0.005f;
+    for (int i = 0; i < K * N; i++) h_B[i] = ((i * 11 + 5) % 200 - 100) * 0.005f;
+
+    auto h_A_h = to_half(h_A);
+    auto h_B_h = to_half(h_B);
+
+    half *d_A, *d_B, *d_C_naive, *d_C_tiled, *d_C_wmma;
+    CUDA_CHECK(cudaMalloc(&d_A, M * K * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_B, K * N * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_C_naive, M * N * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_C_tiled, M * N * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_C_wmma, M * N * sizeof(half)));
+    CUDA_CHECK(cudaMemcpy(d_A, h_A_h.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, h_B_h.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
+
+    launch_gemm_naive(d_C_naive, d_A, d_B, M, N, K);
+    launch_gemm_tiled(d_C_tiled, d_A, d_B, M, N, K);
+    launch_gemm_wmma(d_C_wmma, d_A, d_B, M, N, K);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> h_naive(M * N), h_tiled(M * N), h_wmma(M * N);
+    CUDA_CHECK(cudaMemcpy(h_naive.data(), d_C_naive, M * N * sizeof(half), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_tiled.data(), d_C_tiled, M * N * sizeof(half), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_wmma.data(), d_C_wmma, M * N * sizeof(half), cudaMemcpyDeviceToHost));
+
+    auto r_naive = to_float(h_naive);
+    auto r_tiled = to_float(h_tiled);
+    auto r_wmma = to_float(h_wmma);
+
+    // Cross-compare: all three should agree within FP16 tolerance
+    for (int i = 0; i < M * N; i += 64) {
+        float tol = fmaxf(1.0f, fabsf(r_naive[i]) * 0.1f);
+        TEST_ASSERT(approx_equal(r_naive[i], r_tiled[i], tol),
+                    "naive vs tiled mismatch at realistic size");
+        TEST_ASSERT(approx_equal(r_naive[i], r_wmma[i], tol),
+                    "naive vs wmma mismatch at realistic size");
+    }
+
+    cudaFree(d_A); cudaFree(d_B);
+    cudaFree(d_C_naive); cudaFree(d_C_tiled); cudaFree(d_C_wmma);
+    printf("PASSED\n");
+    return true;
+}
+
 // ============================================================
 //  Test runner
 // ============================================================
@@ -731,6 +824,8 @@ int main() {
     // M4: GEMM
     run(test_gemm_naive,     "GEMM Naive");
     run(test_gemm_tiled,     "GEMM Tiled");
+    run(test_gemm_wmma,      "GEMM wmma");
+    run(test_gemm_realistic, "GEMM Realistic");
 
     printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);
     return (failed > 0) ? 1 : 0;

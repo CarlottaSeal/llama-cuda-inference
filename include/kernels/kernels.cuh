@@ -22,3 +22,4 @@ void launch_rope(half* q, half* k, int seq_len, int num_q_heads, int num_kv_head
 // --- M4: GEMM ---
 void launch_gemm_naive(half* C, const half* A, const half* B, int M, int N, int K);
 void launch_gemm_tiled(half* C, const half* A, const half* B, int M, int N, int K);
+void launch_gemm_wmma(half* C, const half* A, const half* B, int M, int N, int K);
