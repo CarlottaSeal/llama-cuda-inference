@@ -207,6 +207,97 @@ bool test_embedding() {
 }
 
 // ============================================================
+//  M2 Tests: Reduction kernels
+// ============================================================
+
+bool test_rmsnorm() {
+    printf("Testing RMSNorm... ");
+
+    const int ROWS = 4;    // small batch of tokens
+    const int COLS = 2048;  // hidden_size
+    const float EPS = 1e-5f;
+
+    // Input: values in a reasonable range for hidden states
+    std::vector<float> h_x(ROWS * COLS);
+    std::vector<float> h_weight(COLS);
+    for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) {
+            // Mix of positive and negative values
+            h_x[r * COLS + c] = ((r * 137 + c * 31) % 200 - 100) * 0.01f;
+        }
+    }
+    for (int c = 0; c < COLS; c++) {
+        h_weight[c] = 0.5f + ((c % 100) * 0.01f);  // weights around 0.5 - 1.5
+    }
+
+    auto h_x_h = to_half(h_x);
+    auto h_weight_h = to_half(h_weight);
+
+    half *d_x, *d_weight, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_x, ROWS * COLS * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_weight, COLS * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_out, ROWS * COLS * sizeof(half)));
+
+    CUDA_CHECK(cudaMemcpy(d_x, h_x_h.data(), ROWS * COLS * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_weight, h_weight_h.data(), COLS * sizeof(half), cudaMemcpyHostToDevice));
+
+    launch_rmsnorm(d_out, d_x, d_weight, ROWS, COLS, EPS);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> h_out(ROWS * COLS);
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, ROWS * COLS * sizeof(half), cudaMemcpyDeviceToHost));
+    auto result = to_float(h_out);
+
+    // CPU reference: RMSNorm
+    for (int r = 0; r < ROWS; r++) {
+        // Compute RMS
+        float ss = 0.0f;
+        for (int c = 0; c < COLS; c++) {
+            float val = h_x[r * COLS + c];
+            ss += val * val;
+        }
+        float rms_inv = 1.0f / sqrtf(ss / COLS + EPS);
+
+        // Check each element
+        for (int c = 0; c < COLS; c += 64) {  // spot check every 64th
+            float expected = h_x[r * COLS + c] * rms_inv * h_weight[c];
+            float got = result[r * COLS + c];
+            float tol = fmaxf(0.05f, fabsf(expected) * 0.05f);
+            TEST_ASSERT(approx_equal(got, expected, tol), "RMSNorm mismatch");
+        }
+    }
+
+    // Verify normalization property: after RMSNorm (ignoring weight),
+    // the RMS of the output / weight should be ~1.0
+    for (int r = 0; r < ROWS; r++) {
+        float ss = 0.0f;
+        for (int c = 0; c < COLS; c++) {
+            float val = result[r * COLS + c] / h_weight[c];
+            ss += val * val;
+        }
+        float rms = sqrtf(ss / COLS);
+        TEST_ASSERT(approx_equal(rms, 1.0f, 0.1f), "RMSNorm output RMS not ~1.0");
+    }
+
+    // Test in-place: out == x
+    CUDA_CHECK(cudaMemcpy(d_x, h_x_h.data(), ROWS * COLS * sizeof(half), cudaMemcpyHostToDevice));
+    launch_rmsnorm(d_x, d_x, d_weight, ROWS, COLS, EPS);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_x, ROWS * COLS * sizeof(half), cudaMemcpyDeviceToHost));
+    auto result_inplace = to_float(h_out);
+    for (int i = 0; i < ROWS * COLS; i += 256) {
+        TEST_ASSERT(approx_equal(result[i], result_inplace[i], 1e-4f),
+                    "In-place RMSNorm mismatch");
+    }
+
+    cudaFree(d_x);
+    cudaFree(d_weight);
+    cudaFree(d_out);
+    printf("PASSED\n");
+    return true;
+}
+
+// ============================================================
 //  Test runner
 // ============================================================
 
@@ -228,6 +319,9 @@ int main() {
     run(test_residual_add, "Residual Add");
     run(test_silu_mul,     "SiLU+Mul");
     run(test_embedding,    "Embedding");
+
+    // M2: Reduction
+    run(test_rmsnorm,  "RMSNorm");
 
     printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);
     return (failed > 0) ? 1 : 0;

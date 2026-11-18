@@ -24,6 +24,8 @@ set(KERNEL_SOURCES
     src/kernels/residual.cu
     src/kernels/silu.cu
     src/kernels/embedding.cu
+    # M2: reduction kernels
+    src/kernels/rmsnorm.cu
 )
 
 add_library(llama_kernels STATIC ${KERNEL_SOURCES})
