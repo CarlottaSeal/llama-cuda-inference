@@ -19,6 +19,18 @@
 } while (0)
 
 // ============================================================
+//  Integer division, round up
+// ============================================================
+
+__host__ __device__ inline int cdiv(int a, int b) {
+    return (a + b - 1) / b;
+}
+
+// Everything below uses device intrinsics; host-only .cpp files
+// (model loading) include this header for CUDA_CHECK and cdiv.
+#ifdef __CUDACC__
+
+// ============================================================
 //  FP16 conversion helpers
 // ============================================================
 
@@ -28,14 +40,6 @@ __device__ __forceinline__ float half_to_float(half h) {
 
 __device__ __forceinline__ half float_to_half(float f) {
     return __float2half(f);
-}
-
-// ============================================================
-//  Integer division, round up
-// ============================================================
-
-__host__ __device__ inline int cdiv(int a, int b) {
-    return (a + b - 1) / b;
 }
 
 // ============================================================
@@ -118,3 +122,5 @@ __device__ __forceinline__ float block_reduce_max(float val) {
 
     return val;
 }
+
+#endif  // __CUDACC__
