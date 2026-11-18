@@ -218,18 +218,29 @@ bool Tokenizer::load(const std::string& path) {
             if (i >= json.size() || json[i] == ']') { i++; break; }
             if (json[i] == ',') { i++; continue; }
 
-            std::string merge_str;
-            if (!parse_string(json, i, merge_str)) break;
-
-            // Split "a b" into a and b (split on first space)
-            auto space_pos = merge_str.find(' ');
-            if (space_pos != std::string::npos) {
-                Merge m;
+            // Two encodings exist: "a b" (older tokenizers) and ["a", "b"]
+            // (tokenizers >= 0.20). Byte-level tokens never contain a raw space.
+            Merge m;
+            if (json[i] == '[') {
+                i++;
+                skip_ws(json, i);
+                if (!parse_string(json, i, m.a)) break;
+                skip_ws(json, i);
+                if (json[i] == ',') i++;
+                skip_ws(json, i);
+                if (!parse_string(json, i, m.b)) break;
+                skip_ws(json, i);
+                if (json[i] == ']') i++;
+            } else {
+                std::string merge_str;
+                if (!parse_string(json, i, merge_str)) break;
+                auto space_pos = merge_str.find(' ');
+                if (space_pos == std::string::npos) continue;
                 m.a = merge_str.substr(0, space_pos);
                 m.b = merge_str.substr(space_pos + 1);
-                merges_.push_back(m);
-                merge_ranks_[merge_str] = rank++;
             }
+            merge_ranks_[m.a + " " + m.b] = rank++;
+            merges_.push_back(std::move(m));
         }
         printf("  Loaded %zu merges\n", merges_.size());
     }
