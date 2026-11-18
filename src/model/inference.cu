@@ -12,75 +12,10 @@
 //    RMSNorm → Gate+Up Projection (GEMM) → SiLU×Mul
 //    → Down Projection (GEMM) → Residual Add
 //
-//  GEMM note on weight layout:
-//    HuggingFace stores weights as [out_features, in_features].
-//    y = x @ W^T means: for input x[M, K] and weight W[N, K],
-//    output y[M, N] = x * W^T.
-//    Our GEMM computes C[M,N] = A[M,K] * B[K,N], so we need to
-//    transpose: pass weight as B with K=in_features, N=out_features
-//    BUT the weight is stored row-major as [N,K], which when read
-//    as [K,N] column-major IS the transpose. So we pass:
-//      A = input[M, K=hidden], B = weight[K=hidden, N=out] (logical)
-//    Actually, since weight is [N,K] in memory (row-major),
-//    we do: C[M,N] = A[M,K] × B^T where B is [N,K]
-//    Our GEMM assumes row-major: C[M,N] = A[M,K] × B[K,N]
-//    So we need to logically transpose the weight.
-//    Simplest approach: launch_gemm(out, input, weight^T, M, N, K)
-//    where weight^T[K,N] is the weight read as-is since it's [N,K]
-//    stored row-major... actually:
-//
-//    weight stored as [N, K] row-major = [K, N] column-major
-//    Our GEMM does C[M,N] = A[M,K] * B[K,N] (row-major)
-//    So B should be [K,N] row-major.
-//    weight[N,K] row-major → need transpose to get [K,N].
-//
-//    Alternative: since weight is [out, in] = [N, K] row-major,
-//    we can do y = x * W^T by computing:
-//      C^T = W * x^T → but this is awkward for batch.
-//
-//    Cleanest: We'll treat weight as [N,K] and compute
-//    C = A * B^T by swapping dimensions in the GEMM call:
-//      gemm(C, A, W, M, N, K) with the understanding that
-//      internally: C[i,j] = sum_k A[i,k] * W[j,k]
-//    This is exactly what happens if we call:
-//      gemm(C, A, W, M=seq, N=out_dim, K=in_dim)
-//    and our GEMM kernel does C[m,n] = dot(A[m,:], B[:,n])
-//    But W is [N,K] so B[:,n] would be a column of W,
-//    which is W[n,:] = the n-th row of [N,K] matrix.
-//
-//    Wait — let me just be precise:
-//    A[M,K] row-major: element (i,j) at A[i*K+j]
-//    B[K,N] row-major: element (i,j) at B[i*N+j]
-//    C[i,j] = sum_k A[i*K+k] * B[k*N+j]
-//
-//    W is [N,K] row-major: element (i,j) at W[i*K+j]
-//    We want C[m,n] = sum_k input[m,k] * W[n,k]
-//    = sum_k input[m*K+k] * W[n*K+k]
-//
-//    But our GEMM gives: C[m,n] = sum_k A[m*K+k] * B[k*N+n]
-//    where B is [K,N]. So B[k,n] = B[k*N+n].
-//    We need B[k,n] = W[n,k] = W[n*K+k].
-//    This means B is W transposed, which we don't have.
-//
-//    Solution: Add a "transposed B" GEMM variant, OR just
-//    handle it in the kernel. For simplicity, since we control
-//    the GEMM, let's add a flag. BUT that changes all kernels.
-//
-//    Simpler approach: just use the existing GEMM and note that
-//    for the linear layer y = x W^T where W is [out, in]:
-//    We need GEMM(x[M,in], W^T[in,out]) = y[M,out]
-//    Since we can't easily transpose, we'll add a simple
-//    transpose kernel, or better yet, just write a version
-//    of GEMM that does C = A * B^T.
-//
-//    Actually, the SIMPLEST solution: our GEMM multiplies
-//    C[M,N] = A[M,K] * B[K,N]. If we want to compute
-//    x * W^T where W is [N,K]:
-//    We call gemm with A=x[M,K], and reinterpret W[N,K]
-//    as B[K,N] by swapping N and K indices... no, that doesn't work.
-//
-//    Let's just add launch_gemm_transB() that computes
-//    C[M,N] = A[M,K] * B^T[K,N] where B is [N,K].
+//  Weight layout: HF stores linear weights as [out, in] row-major,
+//  but our GEMMs compute C[M,N] = A[M,K] * B[K,N]. Each projection
+//  transposes its weight into a scratch buffer first, then runs the
+//  GEMM. Simple, but it re-transposes every weight on every forward.
 // ============================================================
 
 #include "model/inference.h"
@@ -291,22 +226,6 @@ static void ensure_weight_T_buffer(size_t elements) {
         CUDA_CHECK(cudaMalloc(&s_weight_T, elements * sizeof(half)));
         s_weight_T_size = elements;
     }
-}
-
-void LlamaInference::update_kv_cache(int layer_idx, int seq_len, int start_pos) {
-    using C = LlamaConfig;
-    // Copy K from kv_proj buffer to KV cache at position start_pos
-    // kv_proj layout after K projection: [seq_len, kv_dim]
-    // KV cache layout: [max_seq, kv_dim], we write at row start_pos
-
-    // K is already in kv_proj, copy to cache
-    // We'll call this with the right data pointer set up externally
-    size_t row_bytes = C::kv_dim * sizeof(half);
-    CUDA_CHECK(cudaMemcpy(
-        buf_.kv_cache_k[layer_idx] + (size_t)start_pos * C::kv_dim,
-        buf_.kv_proj,
-        (size_t)seq_len * row_bytes,
-        cudaMemcpyDeviceToDevice));
 }
 
 // ============================================================

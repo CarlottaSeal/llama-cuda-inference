@@ -87,12 +87,6 @@ private:
     bool use_flash_ = true;
     bool use_wmma_ = true;
 
-    // Internal: run one transformer layer
-    void layer_forward(const LlamaLayerWeights& layer, int seq_len, int start_pos);
-
     // Internal: GEMM dispatch (picks wmma or tiled based on config)
     void gemm(half* C, const half* A, const half* B, int M, int N, int K);
-
-    // Internal: copy K,V to cache
-    void update_kv_cache(int layer_idx, int seq_len, int start_pos);
 };
