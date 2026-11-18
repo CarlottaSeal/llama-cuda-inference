@@ -210,8 +210,8 @@ bool LlamaInference::init(int max_seq_len) {
     alloc(&buf_.up,      (size_t)max_seq_ * C::intermediate_size, "up");
     alloc(&buf_.ffn_out, (size_t)max_seq_ * C::hidden_size, "ffn_out");
 
-    // Logits — only need last token for decode, but allocate for max_seq for prefill
-    // Actually we only ever need logits for the last token, so just 1 row
+    // Logits are only computed for the last token
+    alloc(&buf_.logits_half, (size_t)C::vocab_size, "logits_half");
     alloc_f(&buf_.logits, (size_t)C::vocab_size, "logits");
 
     // Token IDs
@@ -242,6 +242,7 @@ void LlamaInference::cleanup() {
     free_ptr(buf_.gate);
     free_ptr(buf_.up);
     free_ptr(buf_.ffn_out);
+    free_ptr(buf_.logits_half);
     free_ptr(buf_.logits);
     free_ptr(buf_.token_ids);
 
@@ -444,18 +445,10 @@ void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start
     launch_transpose(s_weight_T, weights.lm_head, C::vocab_size, C::hidden_size);
 
     // GEMM: [1, hidden] × [hidden, vocab_size] → [1, vocab_size]
-    // Output to a temporary half buffer, then convert to float
-    // Reuse attn_out as temp (it's large enough: q_dim ≥ vocab_size? No.)
-    // vocab_size = 128256, q_dim = 2048. Need a temp buffer.
-    // Use gate buffer: intermediate_size = 8192, still not enough.
-    // Let's use the hidden buffer area: max_seq * hidden_size = 2048*2048 = 4M
-    // vocab_size = 128256 < 4M, so it fits in hidden (we're done with it)
-    half* logits_half = buf_.hidden;  // Reuse — we won't need hidden anymore
+    gemm(buf_.logits_half, last_hidden, s_weight_T, 1, C::vocab_size, C::hidden_size);
 
-    gemm(logits_half, last_hidden, s_weight_T, 1, C::vocab_size, C::hidden_size);
-
-    // Convert to float for softmax / sampling
-    launch_half_to_float(buf_.logits, logits_half, C::vocab_size);
+    // Convert to float for sampling
+    launch_half_to_float(buf_.logits, buf_.logits_half, C::vocab_size);
 
     // Update KV length
     kv_len_ = kv_len;

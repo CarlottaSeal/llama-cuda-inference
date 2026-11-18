@@ -19,7 +19,7 @@
 //    gate:       [max_seq, intermediate]    — FFN gate output
 //    up:         [max_seq, intermediate]    — FFN up output
 //    ffn_out:    [max_seq, hidden_size]     — FFN down output
-//    logits:     [max_seq, vocab_size]      — FP32 logits
+//    logits:     [vocab_size]               — FP32 logits, last token
 //
 //  KV Cache: [num_layers, 2, num_kv_heads, max_seq, head_dim]
 //    Stored in FP16. Key and Value are separate for each layer.
@@ -36,7 +36,8 @@ struct InferenceBuffers {
     half* gate;         // [max_seq, intermediate_size]
     half* up;           // [max_seq, intermediate_size]
     half* ffn_out;      // [max_seq, hidden_size]
-    float* logits;      // [max_seq, vocab_size] — FP32
+    half* logits_half;  // [vocab_size] — LM head GEMM output
+    float* logits;      // [vocab_size] — FP32, last token only
 
     // KV Cache
     // Layout: kv_cache[layer][0=K,1=V] points to [max_seq, num_kv_heads, head_dim]
