@@ -447,8 +447,8 @@ bool test_rope() {
     auto result_k = to_float(h_k_out);
 
     // CPU reference RoPE
-    auto cpu_rope = [&](std::vector<float>& x, int num_heads, int start_pos) {
-        for (int t = 0; t < SEQ_LEN; t++) {
+    auto cpu_rope = [&](std::vector<float>& x, int seq_len, int num_heads, int start_pos) {
+        for (int t = 0; t < seq_len; t++) {
             int pos = start_pos + t;
             for (int h = 0; h < num_heads; h++) {
                 for (int p = 0; p < HEAD_DIM / 2; p++) {
@@ -468,8 +468,8 @@ bool test_rope() {
         }
     };
 
-    cpu_rope(ref_q, NUM_Q_HEADS, START_POS);
-    cpu_rope(ref_k, NUM_KV_HEADS, START_POS);
+    cpu_rope(ref_q, SEQ_LEN, NUM_Q_HEADS, START_POS);
+    cpu_rope(ref_k, SEQ_LEN, NUM_KV_HEADS, START_POS);
 
     // Verify Q (spot check every 4th head, every pair)
     for (int t = 0; t < SEQ_LEN; t++) {
@@ -546,7 +546,7 @@ bool test_rope() {
     auto result_dq = to_float(h_dq_out);
 
     // CPU reference with start_pos=128
-    cpu_rope(ref_dq, NUM_Q_HEADS, DECODE_START);
+    cpu_rope(ref_dq, DECODE_SEQ, NUM_Q_HEADS, DECODE_START);
 
     for (int h = 0; h < NUM_Q_HEADS; h += 8) {
         for (int d = 0; d < HEAD_DIM; d++) {
