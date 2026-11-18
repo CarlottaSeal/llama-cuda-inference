@@ -297,6 +297,105 @@ bool test_rmsnorm() {
     return true;
 }
 
+bool test_softmax() {
+    printf("Testing Softmax... ");
+
+    // Test 1: small row (attention-like)
+    const int ROWS1 = 2;
+    const int COLS1 = 128;
+
+    std::vector<float> h_x1(ROWS1 * COLS1);
+    for (int i = 0; i < ROWS1 * COLS1; i++) {
+        h_x1[i] = (float)(i % 50) * 0.1f - 2.5f;  // range [-2.5, 2.4]
+    }
+
+    float* d_x1;
+    CUDA_CHECK(cudaMalloc(&d_x1, ROWS1 * COLS1 * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_x1, h_x1.data(), ROWS1 * COLS1 * sizeof(float), cudaMemcpyHostToDevice));
+
+    launch_softmax(d_x1, ROWS1, COLS1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> result1(ROWS1 * COLS1);
+    CUDA_CHECK(cudaMemcpy(result1.data(), d_x1, ROWS1 * COLS1 * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Verify: each row sums to 1, all values in [0, 1]
+    for (int r = 0; r < ROWS1; r++) {
+        float row_sum = 0.0f;
+        for (int c = 0; c < COLS1; c++) {
+            float val = result1[r * COLS1 + c];
+            TEST_ASSERT(val >= 0.0f && val <= 1.0f, "Softmax value out of [0,1]");
+            row_sum += val;
+        }
+        TEST_ASSERT(approx_equal(row_sum, 1.0f, 1e-4f), "Softmax row doesn't sum to 1");
+    }
+
+    // Verify against CPU reference
+    for (int r = 0; r < ROWS1; r++) {
+        float max_val = -FLT_MAX;
+        for (int c = 0; c < COLS1; c++) {
+            max_val = fmaxf(max_val, h_x1[r * COLS1 + c]);
+        }
+        float sum = 0.0f;
+        for (int c = 0; c < COLS1; c++) {
+            sum += expf(h_x1[r * COLS1 + c] - max_val);
+        }
+        for (int c = 0; c < COLS1; c += 8) {
+            float expected = expf(h_x1[r * COLS1 + c] - max_val) / sum;
+            TEST_ASSERT(approx_equal(result1[r * COLS1 + c], expected, 1e-5f),
+                        "Softmax mismatch vs CPU reference");
+        }
+    }
+    cudaFree(d_x1);
+
+    // Test 2: large row (vocab-size = 128256)
+    const int ROWS2 = 1;
+    const int COLS2 = 128256;
+    printf("\n  Subtesting vocab-size softmax (cols=%d)... ", COLS2);
+
+    std::vector<float> h_x2(COLS2);
+    for (int i = 0; i < COLS2; i++) {
+        h_x2[i] = (float)(i % 1000) * 0.01f - 5.0f;  // range [-5, 5]
+    }
+
+    float* d_x2;
+    CUDA_CHECK(cudaMalloc(&d_x2, COLS2 * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_x2, h_x2.data(), COLS2 * sizeof(float), cudaMemcpyHostToDevice));
+
+    launch_softmax(d_x2, ROWS2, COLS2);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> result2(COLS2);
+    CUDA_CHECK(cudaMemcpy(result2.data(), d_x2, COLS2 * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Check sum to 1
+    float sum2 = 0.0f;
+    for (int i = 0; i < COLS2; i++) {
+        TEST_ASSERT(result2[i] >= 0.0f, "Softmax negative value");
+        sum2 += result2[i];
+    }
+    TEST_ASSERT(approx_equal(sum2, 1.0f, 1e-3f),
+                "Vocab-size softmax doesn't sum to 1");
+
+    // Check monotonicity: larger input → larger probability
+    // Input has a clear pattern, so we can verify relative ordering
+    // The max input is at indices where (i % 1000) * 0.01 - 5.0 is max → i % 1000 == 999
+    float max_prob = 0.0f;
+    int max_idx = -1;
+    for (int i = 0; i < COLS2; i++) {
+        if (result2[i] > max_prob) {
+            max_prob = result2[i];
+            max_idx = i;
+        }
+    }
+    TEST_ASSERT(max_idx % 1000 == 999, "Softmax argmax incorrect");
+
+    cudaFree(d_x2);
+
+    printf("PASSED\n");
+    return true;
+}
+
 // ============================================================
 //  Test runner
 // ============================================================
@@ -322,6 +421,7 @@ int main() {
 
     // M2: Reduction
     run(test_rmsnorm,  "RMSNorm");
+    run(test_softmax,  "Softmax");
 
     printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);
     return (failed > 0) ? 1 : 0;

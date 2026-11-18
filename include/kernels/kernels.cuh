@@ -14,3 +14,4 @@ void launch_embedding(half* out, const half* table, const int* token_ids, int se
 
 // --- M2: Reduction kernels ---
 void launch_rmsnorm(half* out, const half* x, const half* weight, int rows, int cols, float eps);
+void launch_softmax(float* x, int rows, int cols);

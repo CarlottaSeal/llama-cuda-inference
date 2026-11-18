@@ -26,6 +26,7 @@ set(KERNEL_SOURCES
     src/kernels/embedding.cu
     # M2: reduction kernels
     src/kernels/rmsnorm.cu
+    src/kernels/softmax.cu
 )
 
 add_library(llama_kernels STATIC ${KERNEL_SOURCES})
