@@ -2,10 +2,73 @@
 
 #include <fstream>
 #include <cstring>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#endif
+
+// ============================================================
+//  Read-only file mapping: mmap on POSIX, MapViewOfFile on Windows
+// ============================================================
+
+static void* map_file(const std::string& path, size_t& size, std::string& err) {
+#ifdef _WIN32
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) { err = "Failed to open file: " + path; return nullptr; }
+
+    LARGE_INTEGER li;
+    if (!GetFileSizeEx(file, &li)) {
+        CloseHandle(file);
+        err = "Failed to stat file: " + path;
+        return nullptr;
+    }
+    size = (size_t)li.QuadPart;
+    if (size == 0) { CloseHandle(file); err = "Empty file: " + path; return nullptr; }
+
+    // The view keeps the mapping alive; both handles can be closed now
+    HANDLE mapping = CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    CloseHandle(file);
+    if (!mapping) { err = "CreateFileMapping failed"; return nullptr; }
+    void* ptr = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(mapping);
+    if (!ptr) err = "MapViewOfFile failed";
+    return ptr;
+#else
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) { err = "Failed to open file: " + path; return nullptr; }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        ::close(fd);
+        err = "Failed to stat file: " + path;
+        return nullptr;
+    }
+    size = st.st_size;
+    if (size == 0) { ::close(fd); err = "Empty file: " + path; return nullptr; }
+
+    void* ptr = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (ptr == MAP_FAILED) { err = "mmap failed"; return nullptr; }
+    return ptr;
+#endif
+}
+
+static void unmap_file(void* ptr, size_t size) {
+#ifdef _WIN32
+    (void)size;
+    UnmapViewOfFile(ptr);
+#else
+    munmap(ptr, size);
+#endif
+}
 
 // ============================================================
 //  JSON parsing — minimal hand-rolled parser
@@ -171,7 +234,7 @@ SafetensorsFile::~SafetensorsFile() {
 
 void SafetensorsFile::close() {
     if (mmap_ptr_) {
-        munmap(mmap_ptr_, mmap_size_);
+        unmap_file(mmap_ptr_, mmap_size_);
         mmap_ptr_ = nullptr;
         mmap_size_ = 0;
     }
@@ -181,35 +244,16 @@ void SafetensorsFile::close() {
 bool SafetensorsFile::open(const std::string& path) {
     close();
 
-    // Open file
-    int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        error_ = "Failed to open file: " + path;
+    // Map the entire file read-only
+    mmap_ptr_ = map_file(path, mmap_size_, error_);
+    if (!mmap_ptr_) {
+        mmap_size_ = 0;
         return false;
     }
-
-    // Get file size
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        error_ = "Failed to stat file: " + path;
-        ::close(fd);
-        return false;
-    }
-    mmap_size_ = st.st_size;
 
     if (mmap_size_ < 8) {
         error_ = "File too small for safetensors header";
-        ::close(fd);
-        return false;
-    }
-
-    // mmap the entire file
-    mmap_ptr_ = mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-
-    if (mmap_ptr_ == MAP_FAILED) {
-        mmap_ptr_ = nullptr;
-        error_ = "mmap failed";
+        close();
         return false;
     }
 
