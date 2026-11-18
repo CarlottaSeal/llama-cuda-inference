@@ -126,6 +126,55 @@ bool find_key(const std::string& s, size_t& i, const std::string& key) {
     }
 }
 
+// ============================================================
+//  GPT-2 byte-level alphabet
+//
+//  The vocab never stores raw bytes: each byte is replaced by a printable
+//  code point first (space → 'Ġ' U+0120, '\n' → 'Ċ' U+010A). Bytes 33-126,
+//  161-172 and 174-255 keep their own code point; the other 68 bytes are
+//  assigned U+0100 upwards in byte order.
+// ============================================================
+
+std::string utf8_encode(uint32_t cp) {
+    std::string s;
+    if (cp < 0x80) {
+        s += (char)cp;
+    } else {  // all code points here are < 0x800
+        s += (char)(0xC0 | (cp >> 6));
+        s += (char)(0x80 | (cp & 0x3F));
+    }
+    return s;
+}
+
+struct ByteAlphabet {
+    std::string to_char[256];                       // byte → UTF-8 of its code point
+    std::unordered_map<uint32_t, uint8_t> to_byte;  // code point → byte
+
+    ByteAlphabet() {
+        int next = 0;
+        for (int b = 0; b < 256; b++) {
+            bool keep = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174);
+            uint32_t cp = keep ? (uint32_t)b : 256 + next++;
+            to_char[b] = utf8_encode(cp);
+            to_byte[cp] = (uint8_t)b;
+        }
+    }
+};
+
+const ByteAlphabet& byte_alphabet() {
+    static const ByteAlphabet a;
+    return a;
+}
+
+// Length of the UTF-8 sequence starting with lead byte c
+int utf8_len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if ((c >> 5) == 0x6) return 2;
+    if ((c >> 4) == 0xE) return 3;
+    if ((c >> 3) == 0x1E) return 4;
+    return 1;
+}
+
 } // anonymous namespace
 
 // ============================================================
@@ -341,11 +390,12 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const 
 
     if (text.empty()) return ids;
 
-    // Byte-level BPE: start with individual bytes as initial tokens
-    // Each byte maps to a single-character string in the vocab
+    // Byte-level BPE: start with one token per byte, each byte written as
+    // its byte-level alphabet character (that is how the vocab spells it)
+    const ByteAlphabet& alpha = byte_alphabet();
     std::vector<std::string> tokens;
     for (unsigned char c : text) {
-        tokens.push_back(std::string(1, (char)c));
+        tokens.push_back(alpha.to_char[c]);
     }
 
     // Apply BPE merges
@@ -357,14 +407,15 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const 
         if (it != token_to_id_.end()) {
             ids.push_back(it->second);
         } else {
-            // Unknown token — fall back to byte-level encoding
-            for (unsigned char c : tok) {
-                std::string byte_tok(1, (char)c);
-                auto bit = token_to_id_.find(byte_tok);
+            // Unknown token — fall back to its single-byte characters
+            for (size_t p = 0; p < tok.size();) {
+                int n = utf8_len((unsigned char)tok[p]);
+                auto bit = token_to_id_.find(tok.substr(p, n));
                 if (bit != token_to_id_.end()) {
                     ids.push_back(bit->second);
                 }
                 // If even the byte isn't in vocab, skip it
+                p += n;
             }
         }
     }
@@ -390,5 +441,24 @@ std::string Tokenizer::decode_token(int id) const {
         return "";
     }
 
-    return tok;
+    // Map byte-level alphabet characters back to raw bytes. A multi-byte
+    // UTF-8 character can be split across tokens; the bytes reassemble
+    // once the caller concatenates (or prints) consecutive tokens.
+    const ByteAlphabet& alpha = byte_alphabet();
+    std::string bytes;
+    for (size_t p = 0; p < tok.size();) {
+        unsigned char c = (unsigned char)tok[p];
+        int n = utf8_len(c);
+        uint32_t cp = (n == 2 && p + 1 < tok.size())
+                    ? ((c & 0x1F) << 6) | ((unsigned char)tok[p + 1] & 0x3F)
+                    : c;
+        auto it = alpha.to_byte.find(cp);
+        if (n <= 2 && it != alpha.to_byte.end()) {
+            bytes += (char)it->second;
+        } else {
+            bytes += tok.substr(p, n);
+        }
+        p += n;
+    }
+    return bytes;
 }
