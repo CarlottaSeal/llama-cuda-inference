@@ -139,6 +139,73 @@ bool test_silu_mul() {
     return true;
 }
 
+bool test_embedding() {
+    printf("Testing Embedding Lookup... ");
+
+    const int VOCAB = 1000;
+    const int HIDDEN = 2048;
+    const int SEQ = 8;
+
+    // Create a small embedding table with recognizable values
+    std::vector<float> h_table(VOCAB * HIDDEN);
+    for (int v = 0; v < VOCAB; v++) {
+        for (int h = 0; h < HIDDEN; h++) {
+            // Each row has a unique pattern based on vocab index
+            h_table[v * HIDDEN + h] = (float)v * 0.001f + (float)h * 0.0001f;
+        }
+    }
+
+    int h_ids[SEQ] = {0, 42, 999, 1, 500, 0, 42, 123};
+
+    auto h_table_h = to_half(h_table);
+
+    half* d_table;
+    int* d_ids;
+    half* d_out;
+    CUDA_CHECK(cudaMalloc(&d_table, VOCAB * HIDDEN * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_ids, SEQ * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_out, SEQ * HIDDEN * sizeof(half)));
+
+    CUDA_CHECK(cudaMemcpy(d_table, h_table_h.data(), VOCAB * HIDDEN * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ids, h_ids, SEQ * sizeof(int), cudaMemcpyHostToDevice));
+
+    launch_embedding(d_out, d_table, d_ids, SEQ, HIDDEN);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> h_out(SEQ * HIDDEN);
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, SEQ * HIDDEN * sizeof(half), cudaMemcpyDeviceToHost));
+
+    auto result = to_float(h_out);
+
+    // Verify each token's output matches the correct table row
+    for (int s = 0; s < SEQ; s++) {
+        int id = h_ids[s];
+        for (int h = 0; h < HIDDEN; h += 256) {  // spot check every 256th element
+            float expected = h_table[id * HIDDEN + h];
+            float got = result[s * HIDDEN + h];
+            TEST_ASSERT(approx_equal(got, expected, 0.01f), "Embedding mismatch");
+        }
+    }
+
+    // Verify that duplicate token ids produce identical rows
+    // ids[0] == ids[5] == 0, ids[1] == ids[6] == 42
+    for (int h = 0; h < HIDDEN; h += 128) {
+        float row0 = result[0 * HIDDEN + h];
+        float row5 = result[5 * HIDDEN + h];
+        TEST_ASSERT(approx_equal(row0, row5, 1e-6f), "Duplicate id mismatch (id=0)");
+
+        float row1 = result[1 * HIDDEN + h];
+        float row6 = result[6 * HIDDEN + h];
+        TEST_ASSERT(approx_equal(row1, row6, 1e-6f), "Duplicate id mismatch (id=42)");
+    }
+
+    cudaFree(d_table);
+    cudaFree(d_ids);
+    cudaFree(d_out);
+    printf("PASSED\n");
+    return true;
+}
+
 // ============================================================
 //  Test runner
 // ============================================================
@@ -160,6 +227,7 @@ int main() {
     // M1: Element-wise
     run(test_residual_add, "Residual Add");
     run(test_silu_mul,     "SiLU+Mul");
+    run(test_embedding,    "Embedding");
 
     printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);
     return (failed > 0) ? 1 : 0;

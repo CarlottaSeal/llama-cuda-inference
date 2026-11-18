@@ -10,3 +10,4 @@
 // --- M1: Element-wise kernels ---
 void launch_residual_add(half* out, const half* a, const half* b, int n);
 void launch_silu_mul(half* out, const half* gate, const half* up, int n);
+void launch_embedding(half* out, const half* table, const int* token_ids, int seq_len, int hidden_size);

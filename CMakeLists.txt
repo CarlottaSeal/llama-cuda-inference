@@ -23,6 +23,7 @@ set(KERNEL_SOURCES
     # M1: element-wise kernels
     src/kernels/residual.cu
     src/kernels/silu.cu
+    src/kernels/embedding.cu
 )
 
 add_library(llama_kernels STATIC ${KERNEL_SOURCES})
