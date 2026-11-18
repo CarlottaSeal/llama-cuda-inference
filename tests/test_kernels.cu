@@ -660,6 +660,44 @@ bool test_gemm_naive() {
     return true;
 }
 
+bool test_gemm_tiled() {
+    printf("Testing GEMM Tiled... ");
+
+    // Non-tile-aligned to test boundary handling: 65×97 × 97×33
+    const int M = 65, N = 33, K = 97;
+
+    std::vector<float> h_A(M * K), h_B(K * N);
+    for (int i = 0; i < M * K; i++) h_A[i] = ((i % 300) - 150) * 0.005f;
+    for (int i = 0; i < K * N; i++) h_B[i] = ((i % 250) - 125) * 0.005f;
+
+    std::vector<float> ref_C(M * N);
+    cpu_gemm(h_A, h_B, ref_C, M, N, K);
+
+    auto h_A_h = to_half(h_A);
+    auto h_B_h = to_half(h_B);
+
+    half *d_A, *d_B, *d_C;
+    CUDA_CHECK(cudaMalloc(&d_A, M * K * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_B, K * N * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_C, M * N * sizeof(half)));
+    CUDA_CHECK(cudaMemcpy(d_A, h_A_h.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, h_B_h.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
+
+    launch_gemm_tiled(d_C, d_A, d_B, M, N, K);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> h_C(M * N);
+    CUDA_CHECK(cudaMemcpy(h_C.data(), d_C, M * N * sizeof(half), cudaMemcpyDeviceToHost));
+    auto result = to_float(h_C);
+
+    bool ok = verify_gemm(result, ref_C, M, N, "tiled");
+    TEST_ASSERT(ok, "Tiled GEMM failed verification");
+
+    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+    printf("PASSED\n");
+    return true;
+}
+
 // ============================================================
 //  Test runner
 // ============================================================
@@ -692,6 +730,7 @@ int main() {
 
     // M4: GEMM
     run(test_gemm_naive,     "GEMM Naive");
+    run(test_gemm_tiled,     "GEMM Tiled");
 
     printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);
     return (failed > 0) ? 1 : 0;
