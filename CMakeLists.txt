@@ -21,6 +21,7 @@ include_directories(${PROJECT_SOURCE_DIR}/include)
 set(MODEL_SOURCES
     src/model/safetensors.cpp
     src/model/weight_loader.cpp
+    src/model/tokenizer.cpp
 )
 add_library(llama_model STATIC ${MODEL_SOURCES})
 target_compile_options(llama_model PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
