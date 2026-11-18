@@ -457,12 +457,13 @@ bool test_rope() {
                     float cos_a = cosf(angle);
                     float sin_a = sinf(angle);
 
+                    // HF rotate_half pairing: (p, p + HEAD_DIM/2)
                     long long off = (long long)t * num_heads * HEAD_DIM
-                                  + (long long)h * HEAD_DIM + 2 * p;
+                                  + (long long)h * HEAD_DIM + p;
                     float x0 = x[off];
-                    float x1 = x[off + 1];
-                    x[off]     = x0 * cos_a - x1 * sin_a;
-                    x[off + 1] = x0 * sin_a + x1 * cos_a;
+                    float x1 = x[off + HEAD_DIM / 2];
+                    x[off]                = x0 * cos_a - x1 * sin_a;
+                    x[off + HEAD_DIM / 2] = x0 * sin_a + x1 * cos_a;
                 }
             }
         }

@@ -8,11 +8,15 @@
 //  In-place rotation of Q and K tensors.
 //  Layout: [seq_len, num_heads, head_dim]
 //
-//  For each position pos and dimension pair (2i, 2i+1):
+//  Pairs follow the HF Llama convention (rotate_half): dimension i is
+//  rotated together with i + head_dim/2, not with its neighbour 2i+1.
+//  The HF checkpoints' q_proj/k_proj rows are laid out for this pairing.
+//
+//  For each position pos and pair i in [0, head_dim/2):
 //    freq  = 1.0 / pow(theta, 2*i / head_dim)
 //    angle = pos * freq
-//    x'[2i]   = x[2i]   * cos(angle) - x[2i+1] * sin(angle)
-//    x'[2i+1] = x[2i]   * sin(angle) + x[2i+1] * cos(angle)
+//    x'[i]       = x[i] * cos(angle) - x[i + d/2] * sin(angle)
+//    x'[i + d/2] = x[i] * sin(angle) + x[i + d/2] * cos(angle)
 //
 //  Llama 3.2: theta = 500000, head_dim = 64 → 32 pairs per head
 //
@@ -48,20 +52,21 @@ __global__ void rope_kernel(
     float cos_a = cosf(angle);
     float sin_a = sinf(angle);
 
-    // Pointer to the pair of elements: x[token, head, 2*pair] and x[token, head, 2*pair+1]
+    // The pair: x[token, head, pair] and x[token, head, pair + head_dim/2]
     long long offset = (long long)token * num_heads * head_dim
                      + (long long)head * head_dim
-                     + 2 * pair;
+                     + pair;
+    int half_dim = head_dim / 2;
 
     float x0 = __half2float(x[offset]);
-    float x1 = __half2float(x[offset + 1]);
+    float x1 = __half2float(x[offset + half_dim]);
 
     // Rotation
     float out0 = x0 * cos_a - x1 * sin_a;
     float out1 = x0 * sin_a + x1 * cos_a;
 
-    x[offset]     = __float2half(out0);
-    x[offset + 1] = __float2half(out1);
+    x[offset]            = __float2half(out0);
+    x[offset + half_dim] = __float2half(out1);
 }
 
 void launch_rope(
