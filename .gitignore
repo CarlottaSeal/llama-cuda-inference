@@ -1,0 +1,13 @@
+build/
+models/
+*.o
+*.a
+*.so
+.cache/
+compile_commands.json
+
+# NSight profiling output
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+*.qdstrm

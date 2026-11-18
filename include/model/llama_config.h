@@ -1,0 +1,65 @@
+#pragma once
+
+#include <cuda_fp16.h>
+
+// ============================================================
+//  Llama 3.2 1B — Model Configuration
+//
+//  Source: meta-llama/Llama-3.2-1B config.json
+//  All values hardcoded for this specific model.
+// ============================================================
+
+struct LlamaConfig {
+    // Architecture
+    static constexpr int num_layers    = 16;
+    static constexpr int hidden_size   = 2048;
+    static constexpr int num_q_heads   = 32;     // query heads
+    static constexpr int num_kv_heads  = 8;      // key/value heads (GQA 4:1)
+    static constexpr int head_dim      = 64;     // hidden_size / num_q_heads
+    static constexpr int intermediate_size = 8192; // FFN intermediate
+    static constexpr int vocab_size    = 128256;
+    static constexpr int max_seq_len   = 2048;   // conservative default
+
+    // RoPE
+    static constexpr float rope_theta  = 500000.0f;
+
+    // Normalization
+    static constexpr float rms_norm_eps = 1e-5f;
+
+    // Derived constants
+    static constexpr int gqa_ratio = num_q_heads / num_kv_heads;  // 4
+    static constexpr int q_dim     = num_q_heads * head_dim;      // 2048
+    static constexpr int kv_dim    = num_kv_heads * head_dim;     // 512
+};
+
+// ============================================================
+//  Weight pointers for one transformer layer (all FP16 on GPU)
+// ============================================================
+
+struct LlamaLayerWeights {
+    // Attention
+    half* q_proj;       // [hidden_size, q_dim]
+    half* k_proj;       // [hidden_size, kv_dim]
+    half* v_proj;       // [hidden_size, kv_dim]
+    half* o_proj;       // [q_dim, hidden_size]
+
+    // FFN (SwiGLU)
+    half* gate_proj;    // [hidden_size, intermediate_size]
+    half* up_proj;      // [hidden_size, intermediate_size]
+    half* down_proj;    // [intermediate_size, hidden_size]
+
+    // Norms
+    half* attn_norm;    // [hidden_size]
+    half* ffn_norm;     // [hidden_size]
+};
+
+// ============================================================
+//  All model weights
+// ============================================================
+
+struct LlamaWeights {
+    half* embedding;                    // [vocab_size, hidden_size]
+    LlamaLayerWeights layers[LlamaConfig::num_layers];
+    half* final_norm;                   // [hidden_size]
+    half* lm_head;                      // [vocab_size, hidden_size]
+};
