@@ -6,3 +6,6 @@
 //  Kernel launch function declarations
 //  Added incrementally as each kernel is implemented.
 // ============================================================
+
+// --- M1: Element-wise kernels ---
+void launch_residual_add(half* out, const half* a, const half* b, int n);
