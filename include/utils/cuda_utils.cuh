@@ -34,7 +34,7 @@ __device__ __forceinline__ half float_to_half(float f) {
 //  Integer division, round up
 // ============================================================
 
-inline int cdiv(int a, int b) {
+__host__ __device__ inline int cdiv(int a, int b) {
     return (a + b - 1) / b;
 }
 
