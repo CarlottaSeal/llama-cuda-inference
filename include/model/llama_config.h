@@ -35,6 +35,7 @@ struct LlamaConfig {
     static constexpr int gqa_ratio = num_q_heads / num_kv_heads;  // 4
     static constexpr int q_dim     = num_q_heads * head_dim;      // 2048
     static constexpr int kv_dim    = num_kv_heads * head_dim;     // 512
+    static constexpr int qkv_dim   = q_dim + 2 * kv_dim;          // 3072, fused Q|K|V columns
 };
 
 // ============================================================
@@ -45,9 +46,7 @@ struct LlamaConfig {
 // [in, out], so each projection is a plain C[M,N] = A[M,K] × B[K,N].
 struct LlamaLayerWeights {
     // Attention
-    half* q_proj;       // [hidden_size, q_dim]
-    half* k_proj;       // [hidden_size, kv_dim]
-    half* v_proj;       // [hidden_size, kv_dim]
+    half* qkv_proj;     // [hidden_size, qkv_dim]: columns are W_q | W_k | W_v
     half* o_proj;       // [q_dim, hidden_size]
 
     // FFN (SwiGLU)

@@ -12,9 +12,9 @@
 //  Buffer layout (all FP16 unless noted):
 //    hidden:     [max_seq, hidden_size]     — current hidden states
 //    hidden2:    [max_seq, hidden_size]     — scratch for RMSNorm output
-//    q:          [max_seq, q_dim]           — Q after projection
-//    k:          [max_seq, kv_dim]          — K after projection
-//    v:          [max_seq, kv_dim]          — V after projection
+//    qkv:        [max_seq, qkv_dim]         — fused Q|K|V projection output
+//    q:          [max_seq, q_dim]           — Q split out of qkv (K/V go
+//                                             straight into the KV cache)
 //    attn_out:   [max_seq, q_dim]           — attention output
 //    gate:       [max_seq, intermediate]    — FFN gate output
 //    up:         [max_seq, intermediate]    — FFN up output
@@ -31,7 +31,7 @@ struct InferenceBuffers {
     half* hidden;       // [max_seq, hidden_size]
     half* hidden2;      // [max_seq, hidden_size]
     half* q;            // [max_seq, q_dim]
-    half* kv_proj;      // [max_seq, kv_dim] — shared for K and V projection
+    half* qkv;          // [max_seq, qkv_dim] — fused Q|K|V projection output
     half* attn_out;     // [max_seq, q_dim]
     half* gate;         // [max_seq, intermediate_size]
     half* up;           // [max_seq, intermediate_size]

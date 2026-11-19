@@ -12,9 +12,10 @@ capital and largest city. Paris is the most populous urban area in the European 
 **Status:** runs the official `meta-llama/Llama-3.2-1B` checkpoint end to end. Greedy output
 matches HF `transformers` token for token on the prompts checked (see [Correctness](#correctness)).
 Every kernel is also unit-tested against a CPU reference (14 tests), and the forward pass runs
-clean under `compute-sanitizer`. Decode runs at 145–211 tok/s. It started at ~14.6: transposing
-weights at load time brought it to ~51, and a dedicated M=1 GEMV did the rest. The large decode
-projections now stream weights at 92–95% of DRAM bandwidth; see [Performance](#performance).
+clean under `compute-sanitizer`. Decode runs at ~237 tok/s (128 tokens). It started at ~14.6:
+transposing weights at load time brought it to ~51, a dedicated M=1 GEMV to ~200, and fusing
+Q/K/V into one projection added ~6%. The large decode projections stream weights at 92–95% of
+DRAM bandwidth; see [Performance](#performance).
 
 ## Architecture
 
@@ -24,9 +25,9 @@ Token IDs ──► Embedding Lookup ──► hidden[seq, 2048]
               ┌────────────────────────┘
               │        ×16 Transformer Layers
               ▼
-     ┌─── RMSNorm ───► Q Proj (GEMM) ──► RoPE ──┐
-     │                  K Proj (GEMM) ──► RoPE ──►├─► Attention ──► O Proj ──► + residual
-     │                  V Proj (GEMM) ──► KV Cache┘
+     ┌─── RMSNorm ───► QKV Proj (one GEMM) ──► split ─┬─ Q ──► RoPE ──┐
+     │                                                ├─ K ──► KV Cache ──► RoPE (in place) ──►├─► Attention ──► O Proj ──► + residual
+     │                                                └─ V ──► KV Cache ─────────────────────┘
      │
      └─── RMSNorm ───► Gate Proj ──┐
                        Up Proj ───►├─► SiLU×Mul ──► Down Proj ──► + residual
@@ -257,7 +258,9 @@ the official checkpoint:
 
 RTX 5070 Ti (spec 896 GB/s), CUDA 13.2, Windows, Release build. Prompt `The capital of France is`
 (6 tokens), 3 runs each. Each pair of builds was run interleaved in the same session. Builds are
-commits `3654f25` (runtime transpose), `cdc00ac` (load-time transpose), and this one (+ GEMV):
+commits `3654f25` (runtime transpose), `cdc00ac` (load-time transpose), `530f370` (+ GEMV), and
+this one (+ fused QKV). Absolute numbers drift between sessions (the GEMV build measured 192–211
+tok/s in one session and 223–225 in the next), so compare builds only within a session:
 
 | Build | Generated tokens | Prefill (6 tok) | Decode | Weight load |
 |-------|------------------|-----------------|--------|-------------|
@@ -270,11 +273,23 @@ commits `3654f25` (runtime transpose), `cdc00ac` (load-time transpose), and this
 | load-time transpose | 128 | 27.0–27.9 ms | 50.5–50.7 tok/s | |
 | + decode GEMV | 32  | 27.2–27.4 ms | **144.7–181.6 tok/s** | |
 | + decode GEMV | 128 | 27.1–27.6 ms | **191.8–211.0 tok/s** | |
+| *third session:* | | | | |
+| + decode GEMV | 32  | 23.5–27.2 ms | 165.0–236.2 tok/s | 7.76–7.85 s |
+| + decode GEMV | 128 | 23.7–24.1 ms | 223.1–225.4 tok/s | 7.73–7.79 s |
+| + fused QKV | 32  | 19.4–22.4 ms | 200.8–248.0 tok/s | 7.79–7.88 s |
+| + fused QKV | 128 | 19.4–19.6 ms | **236.2–237.4 tok/s** | 7.78–7.91 s |
 
-Generated text is identical across all three builds on both [Correctness](#correctness) prompts.
+Generated text is identical across all four builds on both [Correctness](#correctness) prompts.
+In the third session, the first 32-token run of each build is the slow end of its range
+(165.0 and 200.8 tok/s). Runs 2–3 are 234–236 vs 246–248.
+
+Fused QKV saves ~0.26 ms per decode step (4.48 → 4.22 ms at 128 tokens, +5.6%) and ~4 ms of
+prefill (3 wmma GEMMs per layer become 1). Its decode GEMV kernel time accounts for only ~0.07 ms
+of that (below). The rest presumably comes from dropping 2 GEMM launches and 2 `cudaMemcpy` calls
+per layer (245 kernels + 32 copies → 213 kernels per token). That split hasn't been measured separately.
 Prefill is unchanged by the GEMV because its 6-row projections still go through wmma, and the LM
 head is only one of 113 GEMMs. The GEMV build's decode spread is much wider than the others'. At
-~5 ms/token, the host side (about 150 launches per token plus the argmax copy back) and GPU clock
+~5 ms/token, the host side (245 kernel launches and 32 device-to-device copies per token, plus the argmax copy back) and GPU clock
 ramp-up show up in the wall time. Short runs are hit harder. This has not been broken down further.
 
 GPU kernel time per forward (nsys `cuda_gpu_kern_sum`, total divided by the number of forwards in each capture):
@@ -295,18 +310,23 @@ With the GEMV, per-shape decode times look like this (nsys, 128-token run, media
 |------------|--------|---------------------|--------|---------------------|
 | q / o | 8.4 MB | 32 × 8 | 11.6 µs | 723 GB/s (81%) |
 | k / v | 2.1 MB | 8 × 32 | 4.7 µs | 446 GB/s (50%) |
+| fused q\|k\|v | 12.6 MB | 48 × 6 | 16.6 µs | 758 GB/s (85%) |
 | gate / up | 33.6 MB | 128 × 3 | 40.8 µs | 822 GB/s (92%) |
 | down | 33.6 MB | 32 × 9 | 40.9 µs | 820 GB/s (92%) |
 | LM head | 525 MB | 2004 × 1 | 617 µs | 851 GB/s (95%) |
 
-Summed over one forward, that is 3.10 ms for 2.47 GB of weights (797 GB/s, 89%). The means are
+The fused row is from the fused-QKV build's capture; the others from the GEMV build's. Fusion
+turns 11.6 + 4.7 + 4.7 = 21.0 µs into 16.6 µs per layer.
+
+Summed over one forward (GEMV build), that is 3.10 ms for 2.47 GB of weights (797 GB/s, 89%);
+with fused QKV, 3.03 ms (815 GB/s, 91%). The means are
 higher than the medians (e.g. 47.9 µs for gate/up) because the first steps run before clocks ramp up.
 In the GEMV build the GPU kernel mix is GEMV 82.7%, attention 6.6%, the prefill wmma GEMMs 4.3%,
 RMSNorm 3.4%, and argmax 1.6% (one ~70 µs launch per token).
 
-What's left: k/v are too small to reach bandwidth on their own. Fusing Q/K/V, and gate/up, into
-one GEMV each (items 1 and 2 below) is the direct fix. After that come launch overhead and the
-host round trip per token.
+What's left: the weights are now read at ~91% of bandwidth overall, so further kernel-side gains
+are small: fusing gate/up (item 1 below) saves one launch and a pass over `gate`/`up`. The
+larger gap is between GPU kernel time and wall time: launch overhead and the host round trip per token.
 
 To sweep prefill and decode throughput:
 ```bash
@@ -318,16 +338,15 @@ To sweep prefill and decode throughput:
 Done:
 - **Weight pre-transpose** (see [Weight Transpose at Load Time](#weight-transpose-at-load-time)): 3.5× decode.
 - **Decode GEMV** (see [GEMM Optimization Path](#gemm-optimization-path)): another 2.9–4.2× decode. The large projections run at 92–95% of DRAM bandwidth.
+- **Fused QKV projection**: W_q | W_k | W_v concatenated at load time into one `[hidden, 3072]` matrix. A split kernel writes Q to its buffer and K/V straight into the KV cache, which replaces the two cache copies. +5.6% decode, −4 ms prefill.
 
 Not implemented yet:
 
-1. **Fused QKV projection** — Concatenate W_q, W_k, W_v into one `[hidden, q_dim+2×kv_dim]` matrix, so decode does one 12.6 MB GEMV instead of 8.4 + 2.1 + 2.1 MB. k/v alone reach only ~446 GB/s, and it also removes two launches per layer.
+1. **Fused gate/up projection** — Same idea for the MLP: one `[hidden, 2×intermediate]` GEMV, with SiLU×Mul folded into its epilogue. gate and up already run at ~92% of bandwidth, so the gain would come from one fewer launch and skipping the `silu_mul` pass, not from the GEMV.
 
-2. **Fused gate/up projection** — Same idea for the MLP: one `[hidden, 2×intermediate]` GEMV, with SiLU×Mul folded into its epilogue.
+2. **Launch overhead / host sync in decode** — 213 kernel launches per token plus a device→host argmax copy. GPU kernel time is still well below wall time per step, so CUDA Graphs (or a persistent kernel) is the next step.
 
-3. **Launch overhead / host sync in decode** — ~150 launches per token plus a device→host argmax copy. GPU kernel time is ~3.7 ms/token by median (~4.35 ms by mean) against ~4.7 ms of wall time in a 128-token run, so CUDA Graphs (or a persistent kernel) is the next step after fusion.
-
-4. **GEMM (prefill): shared tile reuse + double buffering** — Each warp in the wmma kernel loads its own A and B fragments, so the 16 warps in a block don't share tiles, and loads and MMAs run back to back. Block-level shared-memory tiles with double buffering would cut global traffic and hide load latency.
+3. **GEMM (prefill): shared tile reuse + double buffering** — Each warp in the wmma kernel loads its own A and B fragments, so the 16 warps in a block don't share tiles, and loads and MMAs run back to back. Block-level shared-memory tiles with double buffering would cut global traffic and hide load latency.
 
 5. **GEMM: Swizzled shared memory** — Not yet profiled for bank conflicts. If ncu shows them on the staged path, XOR-swizzled layouts (as in CUTLASS) remove them.
 

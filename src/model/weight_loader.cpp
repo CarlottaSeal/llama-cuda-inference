@@ -29,10 +29,49 @@ half* WeightLoader::load_tensor(SafetensorsFile& file,
                                  const std::string& name,
                                  size_t expected_elements,
                                  bool transpose) {
+    std::vector<half> host;
+    if (!read_tensor(file, name, expected_elements, transpose, host)) return nullptr;
+    return upload(host);
+}
+
+half* WeightLoader::upload(const std::vector<half>& host) {
+    size_t gpu_size = host.size() * sizeof(half);
+    half* d_ptr = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_ptr, gpu_size));
+    allocations_.push_back(d_ptr);
+    gpu_bytes_ += gpu_size;
+    CUDA_CHECK(cudaMemcpy(d_ptr, host.data(), gpu_size, cudaMemcpyHostToDevice));
+    return d_ptr;
+}
+
+// Column-concatenate several transposed [K, N_i] weights into one [K, ΣN_i],
+// so projections that read the same input run as one GEMM/GEMV.
+half* WeightLoader::load_fused(SafetensorsFile& file,
+                                const std::vector<std::string>& names,
+                                const std::vector<size_t>& cols, size_t K) {
+    size_t total_cols = 0;
+    for (size_t c : cols) total_cols += c;
+    std::vector<half> fused(K * total_cols);
+    std::vector<half> part;
+    size_t col0 = 0;
+    for (size_t i = 0; i < names.size(); i++) {
+        if (!read_tensor(file, names[i], K * cols[i], /*transpose=*/true, part)) return nullptr;
+        for (size_t k = 0; k < K; k++)
+            std::memcpy(&fused[k * total_cols + col0], &part[k * cols[i]], cols[i] * sizeof(half));
+        col0 += cols[i];
+    }
+    return upload(fused);
+}
+
+bool WeightLoader::read_tensor(SafetensorsFile& file,
+                                const std::string& name,
+                                size_t expected_elements,
+                                bool transpose,
+                                std::vector<half>& out) {
     const TensorInfo* info = file.tensor(name);
     if (!info) {
         error_ = "Tensor not found: " + name;
-        return nullptr;
+        return false;
     }
 
     // Compute number of elements from shape
@@ -43,18 +82,18 @@ half* WeightLoader::load_tensor(SafetensorsFile& file,
         error_ = "Shape mismatch for " + name +
                  ": expected " + std::to_string(expected_elements) +
                  " elements, got " + std::to_string(num_elements);
-        return nullptr;
+        return false;
     }
 
     if (transpose && info->shape.size() != 2) {
         error_ = "Cannot transpose non-2D tensor: " + name;
-        return nullptr;
+        return false;
     }
 
     const void* src = file.tensor_data(*info);
     if (!src) {
         error_ = "Failed to get data for: " + name;
-        return nullptr;
+        return false;
     }
 
     // Convert to FP16 on the host
@@ -78,25 +117,16 @@ half* WeightLoader::load_tensor(SafetensorsFile& file,
         }
     } else {
         error_ = "Unsupported dtype: " + info->dtype + " for " + name;
-        return nullptr;
+        return false;
     }
 
-    const half* upload = host_fp16.data();
-    std::vector<half> host_T;
     if (transpose) {
-        host_T.resize(num_elements);
-        transpose_host(host_T.data(), host_fp16.data(), info->shape[0], info->shape[1]);
-        upload = host_T.data();
+        out.resize(num_elements);
+        transpose_host(out.data(), host_fp16.data(), info->shape[0], info->shape[1]);
+    } else {
+        out = std::move(host_fp16);
     }
-
-    size_t gpu_size = num_elements * sizeof(half);
-    half* d_ptr = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_ptr, gpu_size));
-    allocations_.push_back(d_ptr);
-    gpu_bytes_ += gpu_size;
-    CUDA_CHECK(cudaMemcpy(d_ptr, upload, gpu_size, cudaMemcpyHostToDevice));
-
-    return d_ptr;
+    return true;
 }
 
 // ============================================================
@@ -149,17 +179,12 @@ bool WeightLoader::load(const std::string& model_dir, LlamaWeights& weights) {
         auto& layer = weights.layers[i];
         std::string prefix = "model.layers." + std::to_string(i) + ".";
 
-        layer.q_proj = load_tensor(file, prefix + "self_attn.q_proj.weight",
-                                    C::hidden_size * C::q_dim, /*transpose=*/true);
-        if (!layer.q_proj) return false;
-
-        layer.k_proj = load_tensor(file, prefix + "self_attn.k_proj.weight",
-                                    C::hidden_size * C::kv_dim, /*transpose=*/true);
-        if (!layer.k_proj) return false;
-
-        layer.v_proj = load_tensor(file, prefix + "self_attn.v_proj.weight",
-                                    C::hidden_size * C::kv_dim, /*transpose=*/true);
-        if (!layer.v_proj) return false;
+        layer.qkv_proj = load_fused(file,
+                                    {prefix + "self_attn.q_proj.weight",
+                                     prefix + "self_attn.k_proj.weight",
+                                     prefix + "self_attn.v_proj.weight"},
+                                    {C::q_dim, C::kv_dim, C::kv_dim}, C::hidden_size);
+        if (!layer.qkv_proj) return false;
 
         layer.o_proj = load_tensor(file, prefix + "self_attn.o_proj.weight",
                                     C::q_dim * C::hidden_size, /*transpose=*/true);

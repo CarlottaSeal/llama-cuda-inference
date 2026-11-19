@@ -86,6 +86,34 @@ static void launch_half_to_float(float* out, const half* in, int n) {
 }
 
 // ============================================================
+//  Split the fused QKV projection output
+//
+//  qkv[seq, q_dim | kv_dim | kv_dim] → q[seq, q_dim], and K/V
+//  written straight into this layer's KV cache rows. Replaces the
+//  two cache cudaMemcpys the separate-projection path needed.
+// ============================================================
+
+__global__ void qkv_split_kernel(half* q, half* k_dst, half* v_dst,
+                                 const half* qkv, int seq_len) {
+    using C = LlamaConfig;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;  // index in half2 units
+    constexpr int row2 = C::qkv_dim / 2;
+    if (i >= seq_len * row2) return;
+    int r = i / row2, c = (i % row2) * 2;
+    half2 val = reinterpret_cast<const half2*>(qkv)[i];
+    half* dst;
+    if (c < C::q_dim)                  dst = q     + (size_t)r * C::q_dim  + c;
+    else if (c < C::q_dim + C::kv_dim) dst = k_dst + (size_t)r * C::kv_dim + (c - C::q_dim);
+    else                               dst = v_dst + (size_t)r * C::kv_dim + (c - C::q_dim - C::kv_dim);
+    *reinterpret_cast<half2*>(dst) = val;
+}
+
+static void launch_qkv_split(half* q, half* k_dst, half* v_dst, const half* qkv, int seq_len) {
+    int n2 = seq_len * LlamaConfig::qkv_dim / 2;
+    qkv_split_kernel<<<cdiv(n2, 256), 256>>>(q, k_dst, v_dst, qkv, seq_len);
+}
+
+// ============================================================
 //  Buffer allocation / cleanup
 // ============================================================
 
@@ -118,7 +146,7 @@ bool LlamaInference::init(int max_seq_len) {
     alloc(&buf_.hidden,  (size_t)max_seq_ * C::hidden_size, "hidden");
     alloc(&buf_.hidden2, (size_t)max_seq_ * C::hidden_size, "hidden2");
     alloc(&buf_.q,       (size_t)max_seq_ * C::q_dim, "q");
-    alloc(&buf_.kv_proj, (size_t)max_seq_ * C::kv_dim, "kv_proj");
+    alloc(&buf_.qkv,     (size_t)max_seq_ * C::qkv_dim, "qkv");
     alloc(&buf_.attn_out,(size_t)max_seq_ * C::q_dim, "attn_out");
     alloc(&buf_.gate,    (size_t)max_seq_ * C::intermediate_size, "gate");
     alloc(&buf_.up,      (size_t)max_seq_ * C::intermediate_size, "up");
@@ -151,7 +179,7 @@ void LlamaInference::cleanup() {
     free_ptr(buf_.hidden);
     free_ptr(buf_.hidden2);
     free_ptr(buf_.q);
-    free_ptr(buf_.kv_proj);
+    free_ptr(buf_.qkv);
     free_ptr(buf_.attn_out);
     free_ptr(buf_.gate);
     free_ptr(buf_.up);
@@ -220,35 +248,20 @@ void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start
         launch_rmsnorm(buf_.hidden2, buf_.hidden, layer.attn_norm,
                        seq_len, C::hidden_size, C::rms_norm_eps);
 
-        // 2b. Q projection: q[seq, q_dim] = hidden2[seq, hidden] × W_q^T
-        gemm(buf_.q, buf_.hidden2, layer.q_proj, seq_len, C::q_dim, C::hidden_size);
+        // 2b. Fused QKV projection: qkv[seq, q|k|v] = hidden2[seq, hidden] × W_qkv
+        gemm(buf_.qkv, buf_.hidden2, layer.qkv_proj, seq_len, C::qkv_dim, C::hidden_size);
 
-        // 2c. K projection: kv_proj[seq, kv_dim] = hidden2[seq, hidden] × W_k^T
-        gemm(buf_.kv_proj, buf_.hidden2, layer.k_proj, seq_len, C::kv_dim, C::hidden_size);
+        // 2c. Split: Q → q buffer, K/V → KV cache rows [start_pos .. start_pos+seq_len)
+        half* k_new = buf_.kv_cache_k[l] + (size_t)start_pos * C::kv_dim;
+        half* v_new = buf_.kv_cache_v[l] + (size_t)start_pos * C::kv_dim;
+        launch_qkv_split(buf_.q, k_new, v_new, buf_.qkv, seq_len);
 
-        // 2d. RoPE on Q and K (in-place)
-        launch_rope(buf_.q, buf_.kv_proj, seq_len,
+        // 2d. RoPE on Q and on the new K rows (in place, K inside the cache)
+        launch_rope(buf_.q, k_new, seq_len,
                     C::num_q_heads, C::num_kv_heads, C::head_dim,
                     start_pos, C::rope_theta,
                     RopeScaling{C::rope_factor, C::rope_low_freq_factor,
                                 C::rope_high_freq_factor, C::rope_original_max_pos});
-
-        // 2e. Copy K to cache at [start_pos .. start_pos+seq_len)
-        CUDA_CHECK(cudaMemcpy(
-            buf_.kv_cache_k[l] + (size_t)start_pos * C::kv_dim,
-            buf_.kv_proj,
-            (size_t)seq_len * C::kv_dim * sizeof(half),
-            cudaMemcpyDeviceToDevice));
-
-        // 2f. V projection: kv_proj[seq, kv_dim] = hidden2[seq, hidden] × W_v^T
-        gemm(buf_.kv_proj, buf_.hidden2, layer.v_proj, seq_len, C::kv_dim, C::hidden_size);
-
-        // 2g. Copy V to cache
-        CUDA_CHECK(cudaMemcpy(
-            buf_.kv_cache_v[l] + (size_t)start_pos * C::kv_dim,
-            buf_.kv_proj,
-            (size_t)seq_len * C::kv_dim * sizeof(half),
-            cudaMemcpyDeviceToDevice));
 
         // 2h. Attention: Q against full KV cache [0..kv_len)
         float scale = 1.0f / sqrtf((float)C::head_dim);

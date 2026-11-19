@@ -18,9 +18,7 @@
 //    model.embed_tokens.weight           → embedding
 //    model.norm.weight                   → final_norm
 //    lm_head.weight                      → lm_head
-//    model.layers.{i}.self_attn.q_proj.weight   → layers[i].q_proj
-//    model.layers.{i}.self_attn.k_proj.weight   → layers[i].k_proj
-//    model.layers.{i}.self_attn.v_proj.weight   → layers[i].v_proj
+//    model.layers.{i}.self_attn.{q,k,v}_proj.weight → layers[i].qkv_proj (fused)
 //    model.layers.{i}.self_attn.o_proj.weight   → layers[i].o_proj
 //    model.layers.{i}.mlp.gate_proj.weight      → layers[i].gate_proj
 //    model.layers.{i}.mlp.up_proj.weight        → layers[i].up_proj
@@ -52,4 +50,15 @@ private:
     // transpose=true stores a 2-D tensor with its two dims swapped.
     half* load_tensor(SafetensorsFile& file, const std::string& name,
                       size_t expected_elements, bool transpose = false);
+
+    // Read a tensor into host FP16 (optionally transposed); no GPU work.
+    bool read_tensor(SafetensorsFile& file, const std::string& name,
+                     size_t expected_elements, bool transpose, std::vector<half>& out);
+
+    // Transpose each [N_i, K] HF weight and concatenate them column-wise
+    // into one [K, ΣN_i] GPU tensor.
+    half* load_fused(SafetensorsFile& file, const std::vector<std::string>& names,
+                     const std::vector<size_t>& cols, size_t K);
+
+    half* upload(const std::vector<half>& host);
 };
