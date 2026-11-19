@@ -3,13 +3,17 @@
 A CUDA inference engine for Llama 3.2 1B with **hand-written GPU kernels**. No cuBLAS, no cuDNN, no frameworks — every kernel from scratch.
 
 ```
-$ ./llama_inference ./models/Llama-3.2-1B "The meaning of life is" 64
+$ ./llama_inference ./models/Llama-3.2-1B "The capital of France is" 32
+...
+The capital of France is Paris. It is the most populous city in France and the country’s
+capital and largest city. Paris is the most populous urban area in the European Union and the
 ```
 
-**Status:** every kernel is unit-tested against a CPU reference (13 tests), and the full
-forward pass (prefill + KV-cache decode) runs clean under `compute-sanitizer` with random
-weights. It has not yet been run on the real checkpoint or compared against the HF
-reference, so there is no generated text or end-to-end performance data here yet.
+**Status:** runs the official `meta-llama/Llama-3.2-1B` checkpoint end to end. Greedy output
+matches HF `transformers` token for token on the prompts checked (see [Correctness](#correctness)).
+Every kernel is also unit-tested against a CPU reference (13 tests), and the forward pass runs
+clean under `compute-sanitizer`. Decode is still slow (~14 tok/s); the cause is known and listed
+below.
 
 ## Architecture
 
@@ -163,6 +167,8 @@ With the Visual Studio generator the binaries land in `build/Release/`.
 # Requires huggingface-cli (pip install huggingface-hub)
 huggingface-cli download meta-llama/Llama-3.2-1B --local-dir ./models/Llama-3.2-1B
 ```
+The repo is gated: accept the Llama 3.2 license on its Hugging Face page first. A fine-grained
+token also needs "Read contents of gated repos you can access" enabled.
 
 ### Run Inference
 ```bash
@@ -218,9 +224,31 @@ ncu --kernel-name flash_attention_gqa_kernel --launch-count 8 \
 ```
 Key metrics: achieved occupancy, memory throughput, compute throughput, warp stall reasons.
 
-### Performance
+## Correctness
 
-Not measured yet. To sweep prefill and decode throughput:
+Checked against HF `transformers` (`generate`, greedy, FP16 and FP32 give the same tokens) on
+the official checkpoint:
+
+| Prompt | Generated | Result |
+|--------|-----------|--------|
+| `The capital of France is` | 32 tokens | prompt ids and all 32 generated tokens identical |
+| `In 2024, the GPU had 16,384 cores. def fib(n): return` | 64 tokens | generated text identical; prompt tokenized differently (see Limitations) |
+
+## Performance
+
+RTX 5070 Ti, CUDA 13.2, Windows, Release build. Prompt `The capital of France is` (6 tokens),
+3 runs each:
+
+| Generated tokens | Prefill (6 tok) | Decode |
+|------------------|-----------------|--------|
+| 32  | 84–87 ms | 13.5–14.2 tok/s |
+| 128 | 83–84 ms | 14.1–14.3 tok/s |
+
+That is far below what the hardware allows. A 1B FP16 model is ~2.5 GB of weights, so a
+bandwidth-bound decode step should take a few ms, not ~70 ms. The runtime weight transposes
+(below) are the first suspect; this hasn't been profiled yet.
+
+To sweep prefill and decode throughput:
 ```bash
 ./scripts/benchmark.sh ./models/Llama-3.2-1B [build_dir]
 ```
@@ -251,7 +279,7 @@ Not implemented yet:
 
 - Batch size 1, greedy decoding only (`sample_top_p` is a stub that falls back to greedy).
 - Model shape is hardcoded in `llama_config.h` for Llama 3.2 1B, with `max_seq_len` = 2048.
-- The tokenizer doesn't implement Llama 3's regex pre-tokenization; BPE merges run over the whole byte string, so some inputs can tokenize differently from HF.
+- The tokenizer doesn't implement Llama 3's regex pre-tokenization; BPE merges run over the whole byte string, so some inputs tokenize differently from HF. Digits are one case: `2024` becomes `20`+`24` here and `202`+`4` in HF, which splits numbers into groups of at most three digits first.
 
 ## License
 
