@@ -31,6 +31,9 @@ void launch_rope(half* q, half* k, int seq_len, int num_q_heads, int num_kv_head
 void launch_gemm_naive(half* C, const half* A, const half* B, int M, int N, int K);
 void launch_gemm_tiled(half* C, const half* A, const half* B, int M, int N, int K);
 void launch_gemm_wmma(half* C, const half* A, const half* B, int M, int N, int K);
+// Decode GEMV: y[N] = x[K] × W[K,N] (row-major W). Needs N % 8 == 0.
+bool gemv_supported(int N);
+void launch_gemv(half* y, const half* x, const half* W, int N, int K);
 
 // --- M5: Attention ---
 void launch_attention_naive(half* out, const half* Q, const half* K, const half* V, int seq_len, int kv_len, int num_q_heads, int num_kv_heads, int head_dim, float scale);

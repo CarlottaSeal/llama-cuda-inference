@@ -918,6 +918,70 @@ bool test_gemm_wmma_edges() {
     return true;
 }
 
+bool test_gemv() {
+    printf("Testing decode GEMV... ");
+
+    // Every Llama decode shape (q/o, k/v, gate/up, down), a ragged K, an N
+    // that isn't a multiple of 64, and a wide-N shape that skips split-K.
+    // Each shape runs twice so a stale split-K counter would show up.
+    const int shapes[][2] = {  // {N, K}
+        {2048, 2048}, {512, 2048}, {8192, 2048}, {2048, 8192},
+        {520, 1000}, {8, 37}, {32064, 2048},
+    };
+
+    for (const auto& s : shapes) {
+        int N = s[0], K = s[1];
+        std::vector<float> h_x(K), h_W((size_t)K * N);
+        for (int i = 0; i < K; i++) h_x[i] = ((i * 7 + 3) % 200 - 100) * 0.005f;
+        for (size_t i = 0; i < h_W.size(); i++) h_W[i] = ((int)((i * 11 + 5) % 200) - 100) * 0.005f;
+        auto h_x_h = to_half(h_x);
+        auto h_W_h = to_half(h_W);
+
+        // Reference in double from the FP16-rounded inputs
+        std::vector<float> ref(N);
+        for (int n = 0; n < N; n++) {
+            double acc = 0.0;
+            for (int k = 0; k < K; k++)
+                acc += (double)__half2float(h_x_h[k]) * __half2float(h_W_h[(size_t)k * N + n]);
+            ref[n] = (float)acc;
+        }
+
+        half *d_x, *d_W, *d_y;
+        CUDA_CHECK(cudaMalloc(&d_x, K * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_W, h_W.size() * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_y, N * sizeof(half)));
+        CUDA_CHECK(cudaMemcpy(d_x, h_x_h.data(), K * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_W, h_W_h.data(), h_W.size() * sizeof(half), cudaMemcpyHostToDevice));
+
+        bool ok = gemv_supported(N);
+        std::vector<half> h_y(N), h_y2(N);
+        for (int rep = 0; rep < 2 && ok; rep++) {
+            CUDA_CHECK(cudaMemset(d_y, 0xff, N * sizeof(half)));  // NaN fill: catches unwritten outputs
+            launch_gemv(d_y, d_x, d_W, N, K);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(rep ? h_y2.data() : h_y.data(), d_y, N * sizeof(half), cudaMemcpyDeviceToHost));
+        }
+        for (int n = 0; n < N && ok; n++) {
+            float got = __half2float(h_y[n]);
+            // FP32 accumulation; the error left is FP16 output rounding
+            float tol = fmaxf(1e-2f, fabsf(ref[n]) * 2e-3f);
+            if (!(fabsf(got - ref[n]) <= tol)) {
+                fprintf(stderr, "  gemv N=%d K=%d mismatch at %d: got %f, expected %f\n", N, K, n, got, ref[n]);
+                ok = false;
+            }
+            if (ok && memcmp(&h_y[n], &h_y2[n], sizeof(half)) != 0) {
+                fprintf(stderr, "  gemv N=%d K=%d not deterministic at %d\n", N, K, n);
+                ok = false;
+            }
+        }
+        cudaFree(d_x); cudaFree(d_W); cudaFree(d_y);
+        TEST_ASSERT(ok, "GEMV mismatch");
+    }
+
+    printf("PASSED\n");
+    return true;
+}
+
 // ============================================================
 //  M5 Tests: Attention
 // ============================================================
@@ -1186,6 +1250,7 @@ int main() {
     run(test_gemm_wmma,      "GEMM wmma");
     run(test_gemm_realistic, "GEMM Realistic");
     run(test_gemm_wmma_edges, "GEMM wmma edges");
+    run(test_gemv,            "Decode GEMV");
 
     // M5: Attention
     run(test_attention_naive, "Attention Naive");

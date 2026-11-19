@@ -11,10 +11,10 @@ capital and largest city. Paris is the most populous urban area in the European 
 
 **Status:** runs the official `meta-llama/Llama-3.2-1B` checkpoint end to end. Greedy output
 matches HF `transformers` token for token on the prompts checked (see [Correctness](#correctness)).
-Every kernel is also unit-tested against a CPU reference (13 tests), and the forward pass runs
-clean under `compute-sanitizer`. Decode runs at ~52 tok/s (up from ~14.6 once weights were
-transposed at load time instead of every forward). The GEMM is now 98% of GPU time, and at M=1 it
-is far from bandwidth-bound; see [Performance](#performance).
+Every kernel is also unit-tested against a CPU reference (14 tests), and the forward pass runs
+clean under `compute-sanitizer`. Decode runs at 145–211 tok/s. It started at ~14.6: transposing
+weights at load time brought it to ~51, and a dedicated M=1 GEMV did the rest. The large decode
+projections now stream weights at 92–95% of DRAM bandwidth; see [Performance](#performance).
 
 ## Architecture
 
@@ -51,6 +51,7 @@ Every kernel is written from first principles. Three optimization levels for GEM
 | **GEMM Naive** | `gemm.cu` | 1 thread per output | O(MNK) global loads — the baseline |
 | **GEMM Tiled** | `gemm.cu` | 32×32 shmem tiles | 32× fewer global memory loads, collaborative loading |
 | **GEMM wmma** | `gemm.cu` | Tensor Core 16×16×16 | `nvcuda::wmma` fragments, 4×4 warp grid, FP16→FP32 accumulate |
+| **Decode GEMV** | `gemm.cu` | 64 columns per block, split-K | 128-bit weight loads, block reduce, last-block split-K reduction (one launch, deterministic) |
 | **Attention Naive** | `attention.cu` | Materialize S matrix | 3-pass (QK^T → causal mask + softmax → SV), shmem for scores |
 | **Flash Attention** | `attention.cu` | Online softmax over KV tiles | KV tiles of 32, running (m, l, O) — O(head_dim) memory per block |
 
@@ -80,6 +81,16 @@ wmma::load_matrix_sync(b_frag, sB + ...);   // otherwise via a zero-padded per-w
 wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
 ```
 Edge tiles (decode has M=1, and N/K need not be multiples of 16) take the staged path and a masked store, so the kernel is safe for any shape.
+
+**GEMV (decode, M=1)** → With one token, every projection is `y[N] = x[K] × W[K,N]`, and each weight element is used exactly once. The job is to stream `W` at DRAM bandwidth, so no Tensor Cores and no reuse. `gemm()` sends every M=1 call (all decode projections, and the LM head in both prefill and decode) here, and everything else to wmma.
+```
+block = 256 threads, owns 64 columns
+  lane → (row group = lane/8, column group = lane%8)
+  each thread: uint4 load of W[k, n0 + 8·cg .. +8]   // 8 lanes = one 128 B line, a block covers 32 rows per step
+  acc[8] += x[k] · w                                 // FP32
+block reduce over the 32 row groups (8 KB shmem)
+```
+`k_proj`/`v_proj` have N=512, which is only 8 column blocks for 70 SMs. So K is also split across `gridDim.y` until the grid is about 4×SM blocks. Each block writes its 64 partial sums to a static workspace. The last block of a column range, found with an atomic counter, adds the partials in split order and writes FP16, then resets the counter. That keeps it to one launch with a fixed summation order. Two runs give bit-identical output, and the unit test checks that.
 
 ### Flash Attention
 
@@ -220,8 +231,10 @@ Look for: kernel launch overhead, memory transfer gaps, kernel concurrency.
 
 ### NSight Compute (Kernel Deep Dive)
 ```bash
-# Profile GEMM kernel (each forward launches it ~113 times; cap the count)
+# Profile GEMM kernels (113 per forward: wmma in prefill, gemv_kernel in decode; cap the count)
 ncu --set full --kernel-name gemm_wmma_kernel --launch-count 8 \
+    ./llama_inference ./models/Llama-3.2-1B "Hello" 8
+ncu --set full --kernel-name gemv_kernel --launch-skip 113 --launch-count 8 \
     ./llama_inference ./models/Llama-3.2-1B "Hello" 8
 
 # Profile Flash Attention
@@ -242,9 +255,9 @@ the official checkpoint:
 
 ## Performance
 
-RTX 5070 Ti, CUDA 13.2, Windows, Release build. Prompt `The capital of France is` (6 tokens),
-3 runs each. The two builds were run interleaved in the same session. "runtime transpose" is commit
-`3654f25`:
+RTX 5070 Ti (spec 896 GB/s), CUDA 13.2, Windows, Release build. Prompt `The capital of France is`
+(6 tokens), 3 runs each. Each pair of builds was run interleaved in the same session. Builds are
+commits `3654f25` (runtime transpose), `cdc00ac` (load-time transpose), and this one (+ GEMV):
 
 | Build | Generated tokens | Prefill (6 tok) | Decode | Weight load |
 |-------|------------------|-----------------|--------|-------------|
@@ -252,8 +265,17 @@ RTX 5070 Ti, CUDA 13.2, Windows, Release build. Prompt `The capital of France is
 | runtime transpose | 128 | 81.0–82.1 ms | 14.5–14.7 tok/s | 3.11–3.15 s |
 | load-time transpose | 32  | 24.0–24.6 ms | 51.9–52.2 tok/s | 7.73–7.89 s |
 | load-time transpose | 128 | 24.1–24.4 ms | 51.3–51.8 tok/s | 7.74–7.80 s |
+| *second session:* | | | | |
+| load-time transpose | 32  | 27.1–27.5 ms | 49.7–50.7 tok/s | |
+| load-time transpose | 128 | 27.0–27.9 ms | 50.5–50.7 tok/s | |
+| + decode GEMV | 32  | 27.2–27.4 ms | **144.7–181.6 tok/s** | |
+| + decode GEMV | 128 | 27.1–27.6 ms | **191.8–211.0 tok/s** | |
 
-Generated text is identical between the two builds on both [Correctness](#correctness) prompts.
+Generated text is identical across all three builds on both [Correctness](#correctness) prompts.
+Prefill is unchanged by the GEMV because its 6-row projections still go through wmma, and the LM
+head is only one of 113 GEMMs. The GEMV build's decode spread is much wider than the others'. At
+~5 ms/token, the host side (about 150 launches per token plus the argmax copy back) and GPU clock
+ramp-up show up in the wall time. Short runs are hit harder. This has not been broken down further.
 
 GPU kernel time per forward (nsys `cuda_gpu_kern_sum`, total divided by the number of forwards in each capture):
 
@@ -263,10 +285,28 @@ GPU kernel time per forward (nsys `cuda_gpu_kern_sum`, total divided by the numb
 | `gemm_wmma_kernel` (113 launches) | ~17 ms | ~18 ms (**97.9%** of GPU time) |
 | everything else | < 0.5 ms | < 0.4 ms |
 
-Decode at ~19 ms/token is still far below what the hardware allows. A 1B FP16 model is ~2.5 GB
-of weights, so a bandwidth-bound step should take ~3 ms. At M=1 the wmma GEMM takes at least
-~103 µs per launch. For `q_proj` (8 MB) that works out to ~80 GB/s: it pads the single row to a
-16-row tile and does not stream the weight matrix at full bandwidth. A dedicated decode GEMV is next.
+With load-time transposes, decode took ~19 ms/token. A 1B FP16 model is ~2.5 GB of weights, so a
+bandwidth-bound step should take ~3 ms. At M=1 the wmma GEMM took at least ~103 µs per launch,
+which for `q_proj` (8 MB) is ~80 GB/s: it pads the single row to a 16-row tile.
+
+With the GEMV, per-shape decode times look like this (nsys, 128-token run, median over all launches of that shape):
+
+| Projection | Weight | Grid (cols × split) | Median | Effective bandwidth |
+|------------|--------|---------------------|--------|---------------------|
+| q / o | 8.4 MB | 32 × 8 | 11.6 µs | 723 GB/s (81%) |
+| k / v | 2.1 MB | 8 × 32 | 4.7 µs | 446 GB/s (50%) |
+| gate / up | 33.6 MB | 128 × 3 | 40.8 µs | 822 GB/s (92%) |
+| down | 33.6 MB | 32 × 9 | 40.9 µs | 820 GB/s (92%) |
+| LM head | 525 MB | 2004 × 1 | 617 µs | 851 GB/s (95%) |
+
+Summed over one forward, that is 3.10 ms for 2.47 GB of weights (797 GB/s, 89%). The means are
+higher than the medians (e.g. 47.9 µs for gate/up) because the first steps run before clocks ramp up.
+In the GEMV build the GPU kernel mix is GEMV 82.7%, attention 6.6%, the prefill wmma GEMMs 4.3%,
+RMSNorm 3.4%, and argmax 1.6% (one ~70 µs launch per token).
+
+What's left: k/v are too small to reach bandwidth on their own. Fusing Q/K/V, and gate/up, into
+one GEMV each (items 1 and 2 below) is the direct fix. After that come launch overhead and the
+host round trip per token.
 
 To sweep prefill and decode throughput:
 ```bash
@@ -275,27 +315,29 @@ To sweep prefill and decode throughput:
 
 ## Known Optimization Opportunities
 
-Done: **weight pre-transpose** (see [Weight Transpose at Load Time](#weight-transpose-at-load-time)), 3.5× decode.
+Done:
+- **Weight pre-transpose** (see [Weight Transpose at Load Time](#weight-transpose-at-load-time)): 3.5× decode.
+- **Decode GEMV** (see [GEMM Optimization Path](#gemm-optimization-path)): another 2.9–4.2× decode. The large projections run at 92–95% of DRAM bandwidth.
 
 Not implemented yet:
 
-1. **Decode GEMV** — At seq=1, every projection is a matrix-vector product. A kernel that gives each warp a few output columns and streams the weight with 128-bit loads should approach DRAM bandwidth. The wmma GEMM currently reaches ~80 GB/s on `q_proj`.
+1. **Fused QKV projection** — Concatenate W_q, W_k, W_v into one `[hidden, q_dim+2×kv_dim]` matrix, so decode does one 12.6 MB GEMV instead of 8.4 + 2.1 + 2.1 MB. k/v alone reach only ~446 GB/s, and it also removes two launches per layer.
 
-2. **GEMM: Shared tile reuse + double buffering** — Each warp in the wmma kernel loads its own A and B fragments, so the 16 warps in a block don't share tiles, and loads and MMAs run back to back. Block-level shared-memory tiles with double buffering would cut global traffic and hide load latency.
+2. **Fused gate/up projection** — Same idea for the MLP: one `[hidden, 2×intermediate]` GEMV, with SiLU×Mul folded into its epilogue.
 
-3. **GEMM: Swizzled shared memory** — Not yet profiled for bank conflicts; if ncu shows them on the staged path, XOR-swizzled layouts (as in CUTLASS) remove them.
+3. **Launch overhead / host sync in decode** — ~150 launches per token plus a device→host argmax copy. GPU kernel time is ~3.7 ms/token by median (~4.35 ms by mean) against ~4.7 ms of wall time in a 128-token run, so CUDA Graphs (or a persistent kernel) is the next step after fusion.
 
-4. **Fused QKV projection** — Three separate GEMMs for Q, K, V can be fused into one `[hidden, q_dim+2×kv_dim]` GEMM, reducing kernel launch overhead and improving memory coalescing.
+4. **GEMM (prefill): shared tile reuse + double buffering** — Each warp in the wmma kernel loads its own A and B fragments, so the 16 warps in a block don't share tiles, and loads and MMAs run back to back. Block-level shared-memory tiles with double buffering would cut global traffic and hide load latency.
 
-5. **Flash Attention v2 optimizations** — Current implementation uses a simple tiling scheme. FA2 adds: non-square tiles, warp specialization (producer/consumer), and pipelining within the K/V tile loop.
+5. **GEMM: Swizzled shared memory** — Not yet profiled for bank conflicts. If ncu shows them on the staged path, XOR-swizzled layouts (as in CUTLASS) remove them.
 
-6. **KV Cache quantization** — Storing KV cache in INT8/FP8 would halve cache memory, enabling longer sequences. Requires dequantize-on-the-fly in the attention kernel.
+6. **Flash Attention v2 optimizations** — The current implementation uses one block per (query, head) and no SRAM tiling. FA2 adds non-square tiles, warp specialization (producer/consumer), and pipelining within the K/V tile loop. It is 6.6% of decode GPU time now.
 
-7. **Persistent kernels for decode** — During decode (seq=1), kernel launch overhead dominates. A persistent kernel that stays resident and processes all layers would eliminate launch overhead.
+7. **KV Cache quantization** — Storing the KV cache in INT8/FP8 would halve its memory and allow longer sequences. Requires dequantize-on-the-fly in the attention kernel.
 
-8. **PagedAttention** — Current contiguous KV cache wastes memory on short sequences. Paged allocation (vLLM-style) enables efficient batching of variable-length sequences.
+8. **PagedAttention** — The current contiguous KV cache wastes memory on short sequences. Paged allocation (vLLM-style) enables efficient batching of variable-length sequences.
 
-9. **Speculative decoding** — Use a smaller draft model to propose tokens, verify in parallel with the full model. Can achieve 2-3× effective decode speedup.
+9. **Speculative decoding** — A smaller draft model proposes tokens, and the full model verifies them in parallel. Reported to give 2–3× effective decode speedup.
 
 ## Limitations
 

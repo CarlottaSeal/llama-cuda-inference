@@ -257,3 +257,127 @@ void launch_gemm_wmma(half* C, const half* A, const half* B,
     dim3 grid(cdiv(N, WMMA_BLOCK_N), cdiv(M, WMMA_BLOCK_M));
     gemm_wmma_kernel<<<grid, block>>>(C, A, B, M, N, K);
 }
+
+// ============================================================
+//  4e: Decode GEMV — y[N] = x[K] × W[K,N]   (the M=1 case)
+//
+//  At M=1 every weight element is used exactly once, so the only
+//  thing that matters is streaming W at DRAM bandwidth. The wmma
+//  kernel pads the single row to a 16-row tile and stages it
+//  through shared memory; this kernel does neither.
+//
+//  Block: 256 threads = 8 warps, owns 64 consecutive columns.
+//    lane → (row group rg = lane/8, column group cg = lane%8)
+//    each thread loads one uint4 = 8 halves of W[k, n0+cg*8 ..],
+//    so 8 lanes read one full 128-byte line of a row and a warp
+//    covers 4 rows; the block covers 32 rows per step.
+//  Split-K: narrow outputs (k/v proj: N=512 → 8 column blocks)
+//    can't fill the GPU, so gridDim.y splits K into chunks. Each
+//    block writes its 64 partial sums to a workspace; the last
+//    block to finish a column range (atomic counter) adds the
+//    partials in split order and writes FP16. One launch, and the
+//    summation order is fixed, so results are deterministic.
+//  Requires N % 8 == 0 and 16-byte aligned W (cudaMalloc is).
+// ============================================================
+
+constexpr int GEMV_COLS    = 64;                 // columns per block
+constexpr int GEMV_THREADS = 256;
+constexpr int GEMV_ROWS    = GEMV_THREADS / 8;   // rows per block step (32)
+constexpr int GEMV_MAX_PARTIAL_BLOCKS = 1024;    // cap on split * col_blocks when split > 1
+
+__device__ float    g_gemv_ws[GEMV_MAX_PARTIAL_BLOCKS * GEMV_COLS];
+__device__ unsigned g_gemv_count[GEMV_MAX_PARTIAL_BLOCKS];
+
+__global__ void __launch_bounds__(GEMV_THREADS)
+gemv_kernel(half* __restrict__ y, const half* __restrict__ x,
+            const half* __restrict__ W, int N, int K, int chunk) {
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31, warp = tid >> 5;
+    const int rg   = warp * 4 + (lane >> 3);         // 0..31
+    const int cg   = lane & 7;                       // 0..7
+    const int n0   = blockIdx.x * GEMV_COLS;
+    const int col  = n0 + cg * 8;
+    const int k0   = blockIdx.y * chunk;
+    const int k1   = min(K, k0 + chunk);
+
+    float acc[8] = {};
+    if (col < N) {
+        #pragma unroll 4
+        for (int k = k0 + rg; k < k1; k += GEMV_ROWS) {
+            uint4 w = __ldg(reinterpret_cast<const uint4*>(W + (size_t)k * N + col));
+            float xk = __half2float(x[k]);
+            const half2* w2 = reinterpret_cast<const half2*>(&w);
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float2 f = __half22float2(w2[j]);
+                acc[2 * j]     = fmaf(xk, f.x, acc[2 * j]);
+                acc[2 * j + 1] = fmaf(xk, f.y, acc[2 * j + 1]);
+            }
+        }
+    }
+
+    // Reduce the 32 row groups: red[rg][col_in_block]
+    __shared__ float red[GEMV_ROWS][GEMV_COLS];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) red[rg][cg * 8 + j] = acc[j];
+    __syncthreads();
+
+    float sum = 0.0f;
+    if (tid < GEMV_COLS) {
+        #pragma unroll 8
+        for (int r = 0; r < GEMV_ROWS; r++) sum += red[r][tid];
+    }
+
+    const int n = n0 + tid;
+    if (gridDim.y == 1) {
+        if (tid < GEMV_COLS && n < N) y[n] = __float2half(sum);
+        return;
+    }
+
+    // Split-K: publish this block's partials, last block finishes
+    const int cols_in_grid = gridDim.x * GEMV_COLS;
+    if (tid < GEMV_COLS) g_gemv_ws[blockIdx.y * cols_in_grid + n] = sum;
+    __threadfence();
+    __syncthreads();
+
+    __shared__ bool is_last;
+    if (tid == 0) {
+        unsigned done = atomicAdd(&g_gemv_count[blockIdx.x], 1u);
+        is_last = (done == gridDim.y - 1);
+    }
+    __syncthreads();
+    if (!is_last) return;
+
+    if (tid < GEMV_COLS && n < N) {
+        float total = 0.0f;
+        for (int s = 0; s < (int)gridDim.y; s++)
+            total += __ldcg(&g_gemv_ws[s * cols_in_grid + n]);  // bypass L1: other SMs wrote these
+        y[n] = __float2half(total);
+    }
+    if (tid == 0) g_gemv_count[blockIdx.x] = 0;  // ready for the next launch
+}
+
+bool gemv_supported(int N) { return N % 8 == 0; }
+
+void launch_gemv(half* y, const half* x, const half* W, int N, int K) {
+    static int target_blocks = 0;
+    if (!target_blocks) {
+        int dev = 0, sms = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+        target_blocks = 4 * sms;
+    }
+    const int col_blocks = cdiv(N, GEMV_COLS);
+    int split = 1;
+    if (col_blocks < target_blocks) {
+        split = cdiv(target_blocks, col_blocks);
+        split = min(split, cdiv(K, GEMV_ROWS));                       // >= one block step each
+        split = min(split, GEMV_MAX_PARTIAL_BLOCKS / col_blocks);     // workspace capacity
+        split = max(split, 1);
+    }
+    // Round chunks to whole block steps, then drop empty trailing splits
+    int chunk = cdiv(cdiv(K, split), GEMV_ROWS) * GEMV_ROWS;
+    split = cdiv(K, chunk);
+    dim3 grid(col_blocks, split);
+    gemv_kernel<<<grid, GEMV_THREADS>>>(y, x, W, N, K, chunk);
+}

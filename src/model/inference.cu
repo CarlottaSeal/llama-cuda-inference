@@ -176,11 +176,14 @@ void LlamaInference::set_tokens(const int* ids, int count, int offset) {
 }
 
 // ============================================================
-//  GEMM dispatch — picks wmma or tiled
+//  GEMM dispatch — GEMV for a single row (decode, LM head),
+//  otherwise wmma or tiled
 // ============================================================
 
 void LlamaInference::gemm(half* C, const half* A, const half* B, int M, int N, int K) {
-    if (use_wmma_) {
+    if (M == 1 && gemv_supported(N)) {
+        launch_gemv(C, A, B, N, K);
+    } else if (use_wmma_) {
         launch_gemm_wmma(C, A, B, M, N, K);
     } else {
         launch_gemm_tiled(C, A, B, M, N, K);
