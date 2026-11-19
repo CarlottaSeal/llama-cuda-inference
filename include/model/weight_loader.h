@@ -48,7 +48,8 @@ private:
     size_t gpu_bytes_ = 0;
     std::vector<half*> allocations_;  // track for cleanup
 
-    // Copy a tensor from safetensors to GPU, handling dtype conversion
+    // Copy a tensor from safetensors to GPU, handling dtype conversion.
+    // transpose=true stores a 2-D tensor with its two dims swapped.
     half* load_tensor(SafetensorsFile& file, const std::string& name,
-                      size_t expected_elements);
+                      size_t expected_elements, bool transpose = false);
 };

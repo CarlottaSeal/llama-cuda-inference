@@ -12,10 +12,9 @@
 //    RMSNorm → Gate+Up Projection (GEMM) → SiLU×Mul
 //    → Down Projection (GEMM) → Residual Add
 //
-//  Weight layout: HF stores linear weights as [out, in] row-major,
-//  but our GEMMs compute C[M,N] = A[M,K] * B[K,N]. Each projection
-//  transposes its weight into a scratch buffer first, then runs the
-//  GEMM. Simple, but it re-transposes every weight on every forward.
+//  Weight layout: HF stores linear weights as [out, in]; the loader
+//  transposes them once to [in, out], so every projection here is a
+//  plain C[M,N] = A[M,K] × B[K,N] with no per-forward transposes.
 // ============================================================
 
 #include "model/inference.h"
@@ -26,26 +25,6 @@
 #include <cstring>
 #include <cfloat>
 #include <cmath>
-
-// ============================================================
-//  Simple GPU transpose kernel: B_out[K,N] = B_in[N,K]^T
-//  Used to prepare weight matrices for our GEMM
-// ============================================================
-
-__global__ void transpose_kernel(half* out, const half* in, int rows, int cols) {
-    // in[rows, cols] → out[cols, rows]
-    int r = blockIdx.y * blockDim.y + threadIdx.y;
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r < rows && c < cols) {
-        out[c * rows + r] = in[r * cols + c];
-    }
-}
-
-static void launch_transpose(half* out, const half* in, int rows, int cols) {
-    dim3 block(32, 32);
-    dim3 grid(cdiv(cols, 32), cdiv(rows, 32));
-    transpose_kernel<<<grid, block>>>(out, in, rows, cols);
-}
 
 // ============================================================
 //  Argmax kernel for greedy sampling
@@ -209,26 +188,6 @@ void LlamaInference::gemm(half* C, const half* A, const half* B, int M, int N, i
 }
 
 // ============================================================
-//  Linear layer: out[M, N] = input[M, K] × weight^T[K, N]
-//  where weight is stored as [N, K] (HuggingFace convention).
-//
-//  We need a scratch buffer for the transposed weight [K, N].
-//  To avoid allocating per-call, we use a static persistent buffer.
-// ============================================================
-
-// Scratch buffer for weight transpose
-static half* s_weight_T = nullptr;
-static size_t s_weight_T_size = 0;
-
-static void ensure_weight_T_buffer(size_t elements) {
-    if (elements > s_weight_T_size) {
-        if (s_weight_T) cudaFree(s_weight_T);
-        CUDA_CHECK(cudaMalloc(&s_weight_T, elements * sizeof(half)));
-        s_weight_T_size = elements;
-    }
-}
-
-// ============================================================
 //  Forward pass — single call through all layers
 //
 //  seq_len: number of NEW tokens in this pass
@@ -242,14 +201,6 @@ void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start
     using C = LlamaConfig;
 
     int kv_len = start_pos + seq_len;  // total KV length after this pass
-
-    // Ensure transpose buffer is large enough for largest weight
-    // Largest weight: gate/up/down projections = hidden_size × intermediate_size
-    size_t max_weight = (size_t)C::hidden_size * C::intermediate_size;
-    // lm_head: vocab_size × hidden_size — even bigger
-    size_t lm_head_size = (size_t)C::vocab_size * C::hidden_size;
-    if (lm_head_size > max_weight) max_weight = lm_head_size;
-    ensure_weight_T_buffer(max_weight);
 
     // ---- Step 1: Embedding lookup ----
     // hidden[seq_len, hidden_size] = embedding_table[token_ids[start_pos:]]
@@ -267,13 +218,10 @@ void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start
                        seq_len, C::hidden_size, C::rms_norm_eps);
 
         // 2b. Q projection: q[seq, q_dim] = hidden2[seq, hidden] × W_q^T
-        //     W_q is [q_dim, hidden_size], we need [hidden_size, q_dim]
-        launch_transpose(s_weight_T, layer.q_proj, C::q_dim, C::hidden_size);
-        gemm(buf_.q, buf_.hidden2, s_weight_T, seq_len, C::q_dim, C::hidden_size);
+        gemm(buf_.q, buf_.hidden2, layer.q_proj, seq_len, C::q_dim, C::hidden_size);
 
         // 2c. K projection: kv_proj[seq, kv_dim] = hidden2[seq, hidden] × W_k^T
-        launch_transpose(s_weight_T, layer.k_proj, C::kv_dim, C::hidden_size);
-        gemm(buf_.kv_proj, buf_.hidden2, s_weight_T, seq_len, C::kv_dim, C::hidden_size);
+        gemm(buf_.kv_proj, buf_.hidden2, layer.k_proj, seq_len, C::kv_dim, C::hidden_size);
 
         // 2d. RoPE on Q and K (in-place)
         launch_rope(buf_.q, buf_.kv_proj, seq_len,
@@ -290,8 +238,7 @@ void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start
             cudaMemcpyDeviceToDevice));
 
         // 2f. V projection: kv_proj[seq, kv_dim] = hidden2[seq, hidden] × W_v^T
-        launch_transpose(s_weight_T, layer.v_proj, C::kv_dim, C::hidden_size);
-        gemm(buf_.kv_proj, buf_.hidden2, s_weight_T, seq_len, C::kv_dim, C::hidden_size);
+        gemm(buf_.kv_proj, buf_.hidden2, layer.v_proj, seq_len, C::kv_dim, C::hidden_size);
 
         // 2g. Copy V to cache
         CUDA_CHECK(cudaMemcpy(
@@ -318,9 +265,7 @@ void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start
         }
 
         // 2i. O projection: ffn_out[seq, hidden] = attn_out[seq, q_dim] × W_o^T
-        //     W_o is [hidden_size, q_dim]
-        launch_transpose(s_weight_T, layer.o_proj, C::hidden_size, C::q_dim);
-        gemm(buf_.ffn_out, buf_.attn_out, s_weight_T, seq_len, C::hidden_size, C::q_dim);
+        gemm(buf_.ffn_out, buf_.attn_out, layer.o_proj, seq_len, C::hidden_size, C::q_dim);
 
         // 2j. Residual: hidden += ffn_out
         launch_residual_add(buf_.hidden, buf_.hidden, buf_.ffn_out,
@@ -333,20 +278,17 @@ void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start
                        seq_len, C::hidden_size, C::rms_norm_eps);
 
         // 2l. Gate projection: gate[seq, intermediate] = hidden2 × W_gate^T
-        launch_transpose(s_weight_T, layer.gate_proj, C::intermediate_size, C::hidden_size);
-        gemm(buf_.gate, buf_.hidden2, s_weight_T, seq_len, C::intermediate_size, C::hidden_size);
+        gemm(buf_.gate, buf_.hidden2, layer.gate_proj, seq_len, C::intermediate_size, C::hidden_size);
 
         // 2m. Up projection: up[seq, intermediate] = hidden2 × W_up^T
-        launch_transpose(s_weight_T, layer.up_proj, C::intermediate_size, C::hidden_size);
-        gemm(buf_.up, buf_.hidden2, s_weight_T, seq_len, C::intermediate_size, C::hidden_size);
+        gemm(buf_.up, buf_.hidden2, layer.up_proj, seq_len, C::intermediate_size, C::hidden_size);
 
         // 2n. SiLU(gate) × up → gate  (in-place)
         launch_silu_mul(buf_.gate, buf_.gate, buf_.up,
                         seq_len * C::intermediate_size);
 
         // 2o. Down projection: ffn_out[seq, hidden] = gate[seq, intermediate] × W_down^T
-        launch_transpose(s_weight_T, layer.down_proj, C::hidden_size, C::intermediate_size);
-        gemm(buf_.ffn_out, buf_.gate, s_weight_T, seq_len, C::hidden_size, C::intermediate_size);
+        gemm(buf_.ffn_out, buf_.gate, layer.down_proj, seq_len, C::hidden_size, C::intermediate_size);
 
         // 2p. Residual: hidden += ffn_out
         launch_residual_add(buf_.hidden, buf_.hidden, buf_.ffn_out,
@@ -359,14 +301,12 @@ void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start
 
     // ---- Step 4: LM Head (only for last token) ----
     // hidden2[last_token, hidden_size] × lm_head^T → logits[vocab_size]
-    // lm_head is [vocab_size, hidden_size]
+    // lm_head is stored as [hidden_size, vocab_size]
     half* last_hidden = buf_.hidden2 + (size_t)(seq_len - 1) * C::hidden_size;
 
-    // Transpose lm_head: [vocab_size, hidden] → [hidden, vocab_size]
-    launch_transpose(s_weight_T, weights.lm_head, C::vocab_size, C::hidden_size);
 
     // GEMM: [1, hidden] × [hidden, vocab_size] → [1, vocab_size]
-    gemm(buf_.logits_half, last_hidden, s_weight_T, 1, C::vocab_size, C::hidden_size);
+    gemm(buf_.logits_half, last_hidden, weights.lm_head, 1, C::vocab_size, C::hidden_size);
 
     // Convert to float for sampling
     launch_half_to_float(buf_.logits, buf_.logits_half, C::vocab_size);
@@ -403,16 +343,3 @@ int LlamaInference::sample_top_p(int seq_len, float temperature, float top_p) {
     // For now, just use greedy
     return sample_greedy(seq_len);
 }
-
-// ============================================================
-//  Free static transpose buffer on program exit
-// ============================================================
-
-static struct WeightTCleanup {
-    ~WeightTCleanup() {
-        if (s_weight_T) {
-            cudaFree(s_weight_T);
-            s_weight_T = nullptr;
-        }
-    }
-} s_cleanup;

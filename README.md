@@ -12,8 +12,9 @@ capital and largest city. Paris is the most populous urban area in the European 
 **Status:** runs the official `meta-llama/Llama-3.2-1B` checkpoint end to end. Greedy output
 matches HF `transformers` token for token on the prompts checked (see [Correctness](#correctness)).
 Every kernel is also unit-tested against a CPU reference (13 tests), and the forward pass runs
-clean under `compute-sanitizer`. Decode is still slow (~14 tok/s); the cause is known and listed
-below.
+clean under `compute-sanitizer`. Decode runs at ~52 tok/s (up from ~14.6 once weights were
+transposed at load time instead of every forward). The GEMM is now 98% of GPU time, and at M=1 it
+is far from bandwidth-bound; see [Performance](#performance).
 
 ## Architecture
 
@@ -149,7 +150,7 @@ llama-cuda-inference/
 - CUDA Toolkit 11.0+ and a Tensor Core GPU (sm_70+) for the wmma path
 - CMake 3.18+
 - A C++17 host compiler (GCC/Clang, or MSVC with Visual Studio 2022)
-- ~3 GB VRAM: 2.5 GB of FP16 weights, a 0.5 GB transpose scratch buffer (sized for the LM head), plus KV cache and activations
+- ~3 GB VRAM: 2.86 GB of FP16 weights (2.36 GB, plus a 0.5 GB transposed copy of the tied embedding for the LM head), plus KV cache and activations
 
 Developed and tested on Windows (MSVC, CUDA 13.2, RTX 5070 Ti / sm_120). The POSIX `mmap` path is in place but hasn't been built on Linux yet.
 
@@ -187,8 +188,13 @@ Tests cover every kernel with CPU reference implementations and cross-variant co
 ### FP16 Storage, FP32 Accumulation
 All weights and activations stored as FP16 (`half`) to minimize memory bandwidth. All dot products and reductions accumulate in FP32 to prevent precision loss, then convert back to FP16 for storage.
 
-### Weight Transpose at Runtime
-HuggingFace stores linear layer weights as `[out_features, in_features]`. Our GEMM computes `C[M,N] = A[M,K] × B[K,N]`, so each projection first transposes its weight into a static scratch buffer, then runs the GEMM. That keeps one GEMM interface for everything, but it is not cheap: 7 transposes per layer plus the LM head is 113 transpose kernels per forward, and the 128256×2048 LM head alone is ~0.5 GB read and ~0.5 GB written. For decode, which should only need to read each weight once, this likely dominates the step time. Pre-transposing once at load time (or a `C = A × Bᵀ` GEMM) is the first optimization on the list below.
+### Weight Transpose at Load Time
+HuggingFace stores linear layer weights as `[out_features, in_features]`. Our GEMM computes `C[M,N] = A[M,K] × B[K,N]`, so the loader transposes every linear weight once on the host (64×64 blocked) to `[in, out]` before uploading it. The forward pass then calls the GEMM on the weights directly.
+
+The first version transposed each weight into a scratch buffer on every forward: 113 transpose kernels per forward, ~53 ms of a ~70 ms decode step (nsys). Moving that to load time:
+
+- Llama 3.2 1B ties `lm_head` to `embed_tokens`. The embedding lookup needs `[vocab, hidden]` rows and the LM head GEMM needs `[hidden, vocab]`, so the LM head gets its own transposed copy: +0.5 GB of weights, about what the old scratch buffer took.
+- Weight loading goes from ~3.1 s to ~7.8 s, because the transpose is single-threaded CPU code. A GPU transpose at upload time, or a `C = A × Bᵀ` GEMM that reads HF's layout directly, would remove that cost. Neither is done yet.
 
 ### KV Cache Layout
 ```
@@ -237,16 +243,30 @@ the official checkpoint:
 ## Performance
 
 RTX 5070 Ti, CUDA 13.2, Windows, Release build. Prompt `The capital of France is` (6 tokens),
-3 runs each:
+3 runs each. The two builds were run interleaved in the same session. "runtime transpose" is commit
+`3654f25`:
 
-| Generated tokens | Prefill (6 tok) | Decode |
-|------------------|-----------------|--------|
-| 32  | 84–87 ms | 13.5–14.2 tok/s |
-| 128 | 83–84 ms | 14.1–14.3 tok/s |
+| Build | Generated tokens | Prefill (6 tok) | Decode | Weight load |
+|-------|------------------|-----------------|--------|-------------|
+| runtime transpose | 32  | 80.8–81.8 ms | 14.6–14.8 tok/s | 3.09–3.14 s |
+| runtime transpose | 128 | 81.0–82.1 ms | 14.5–14.7 tok/s | 3.11–3.15 s |
+| load-time transpose | 32  | 24.0–24.6 ms | 51.9–52.2 tok/s | 7.73–7.89 s |
+| load-time transpose | 128 | 24.1–24.4 ms | 51.3–51.8 tok/s | 7.74–7.80 s |
 
-That is far below what the hardware allows. A 1B FP16 model is ~2.5 GB of weights, so a
-bandwidth-bound decode step should take a few ms, not ~70 ms. The runtime weight transposes
-(below) are the first suspect; this hasn't been profiled yet.
+Generated text is identical between the two builds on both [Correctness](#correctness) prompts.
+
+GPU kernel time per forward (nsys `cuda_gpu_kern_sum`, total divided by the number of forwards in each capture):
+
+| Kernel | runtime transpose | load-time transpose |
+|--------|-------------------|---------------------|
+| `transpose_kernel` | ~53 ms | — |
+| `gemm_wmma_kernel` (113 launches) | ~17 ms | ~18 ms (**97.9%** of GPU time) |
+| everything else | < 0.5 ms | < 0.4 ms |
+
+Decode at ~19 ms/token is still far below what the hardware allows. A 1B FP16 model is ~2.5 GB
+of weights, so a bandwidth-bound step should take ~3 ms. At M=1 the wmma GEMM takes at least
+~103 µs per launch. For `q_proj` (8 MB) that works out to ~80 GB/s: it pads the single row to a
+16-row tile and does not stream the weight matrix at full bandwidth. A dedicated decode GEMV is next.
 
 To sweep prefill and decode throughput:
 ```bash
@@ -255,9 +275,11 @@ To sweep prefill and decode throughput:
 
 ## Known Optimization Opportunities
 
+Done: **weight pre-transpose** (see [Weight Transpose at Load Time](#weight-transpose-at-load-time)), 3.5× decode.
+
 Not implemented yet:
 
-1. **Weight pre-transpose** — Weights are re-transposed on every forward pass (113 transpose kernels, ~1 GB of extra traffic from the LM head alone). Transposing once at load time removes all of it.
+1. **Decode GEMV** — At seq=1, every projection is a matrix-vector product. A kernel that gives each warp a few output columns and streams the weight with 128-bit loads should approach DRAM bandwidth. The wmma GEMM currently reaches ~80 GB/s on `q_proj`.
 
 2. **GEMM: Shared tile reuse + double buffering** — Each warp in the wmma kernel loads its own A and B fragments, so the 16 warps in a block don't share tiles, and loads and MMAs run back to back. Block-level shared-memory tiles with double buffering would cut global traffic and hide load latency.
 

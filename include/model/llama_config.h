@@ -41,6 +41,8 @@ struct LlamaConfig {
 //  Weight pointers for one transformer layer (all FP16 on GPU)
 // ============================================================
 
+// Linear weights are transposed at load time from HF's [out, in] to
+// [in, out], so each projection is a plain C[M,N] = A[M,K] × B[K,N].
 struct LlamaLayerWeights {
     // Attention
     half* q_proj;       // [hidden_size, q_dim]
@@ -66,5 +68,5 @@ struct LlamaWeights {
     half* embedding;                    // [vocab_size, hidden_size]
     LlamaLayerWeights layers[LlamaConfig::num_layers];
     half* final_norm;                   // [hidden_size]
-    half* lm_head;                      // [vocab_size, hidden_size]
+    half* lm_head;                      // [hidden_size, vocab_size] (transposed)
 };
