@@ -325,8 +325,46 @@ In the GEMV build the GPU kernel mix is GEMV 82.7%, attention 6.6%, the prefill 
 RMSNorm 3.4%, and argmax 1.6% (one ~70 µs launch per token).
 
 What's left: the weights are now read at ~91% of bandwidth overall, so further kernel-side gains
-are small: fusing gate/up (item 1 below) saves one launch and a pass over `gate`/`up`. The
+are small: fusing gate/up (item 3 below) saves one launch and a pass over `gate`/`up`. The
 larger gap is between GPU kernel time and wall time: launch overhead and the host round trip per token.
+
+### Context length
+
+The tables above use a 6-token prompt, so attention barely shows up. With longer contexts it takes
+over, in both phases (fused-QKV build, nsys).
+
+**Decode**: one run from a 6-token prompt to kv_len 2048. Each decode step is matched to its kv_len,
+and each row is the median over steps within ±16:
+
+| kv_len | Attention / token | GPU time / token | Attention share | Attention / layer |
+|--------|-------------------|------------------|-----------------|-------------------|
+| 64   | 0.28 ms | 3.61 ms  | 7.9%  | 17.8 µs |
+| 128  | 0.50 ms | 3.84 ms  | 13.1% | 31.4 µs |
+| 256  | 0.97 ms | 4.29 ms  | 22.6% | 60.8 µs |
+| 512  | 1.88 ms | 5.21 ms  | 36.1% | 118 µs |
+| 1024 | 3.82 ms | 7.27 ms  | 52.5% | 239 µs |
+| 1536 | 5.50 ms | 8.82 ms  | 62.3% | 344 µs |
+| 2032 | 7.44 ms | 10.98 ms | 67.8% | 465 µs |
+
+At kv_len 2032 a layer's K and V are 4.2 MB, read in 465 µs: ~9 GB/s, two orders of magnitude
+below what the GEMVs reach. The decode attention launches one block per (query, head), so 32
+blocks, and each walks the whole KV range serially. It is latency-bound, not bandwidth-bound.
+Each KV head is also read by 4 separate Q-head blocks.
+
+**Prefill**: prompts of repeated text, generating 1 token. Wall time is from 3 plain runs; the
+kernel split is from one nsys run of the prefill forward:
+
+| Prompt tokens | Prefill wall | Attention | wmma GEMM | GEMV (LM head) | Attention share |
+|---------------|--------------|-----------|-----------|----------------|-----------------|
+| 131  | 28.1–29.2 ms   | 2.2 ms   | 23.4 ms  | 0.6 ms | 8.4%  |
+| 511  | 114.4–115.6 ms | 31.0 ms  | 79.2 ms  | 0.6 ms | 27.7% |
+| 1021 | 272.7–278.8 ms | 119.0 ms | 147.3 ms | 0.6 ms | 44.2% |
+| 2001 | 717.4–723.2 ms | 454.0 ms | 265.0 ms | 0.6 ms | 62.7% |
+
+Attention grows quadratically: at 2001 tokens it is ~0.26 TFLOP of causal attention in 454 ms,
+~0.6 TFLOPS. The wmma GEMMs do ~3.9 TFLOP in 265 ms, ~15 TFLOPS. Both are far from the GPU's
+Tensor Core rate. For comparison, the author's FlashAttention-lite v5 (mma.sync, cp.async, swizzled
+shmem) runs a non-causal N=2048, D=64, 16-head forward in 0.273 ms, ~63 TFLOPS on this GPU.
 
 To sweep prefill and decode throughput:
 ```bash
@@ -340,17 +378,19 @@ Done:
 - **Decode GEMV** (see [GEMM Optimization Path](#gemm-optimization-path)): another 2.9–4.2× decode. The large projections run at 92–95% of DRAM bandwidth.
 - **Fused QKV projection**: W_q | W_k | W_v concatenated at load time into one `[hidden, 3072]` matrix. A split kernel writes Q to its buffer and K/V straight into the KV cache, which replaces the two cache copies. +5.6% decode, −4 ms prefill.
 
-Not implemented yet:
+Not implemented yet, in the order the measurements suggest:
 
-1. **Fused gate/up projection** — Same idea for the MLP: one `[hidden, 2×intermediate]` GEMV, with SiLU×Mul folded into its epilogue. gate and up already run at ~92% of bandwidth, so the gain would come from one fewer launch and skipping the `silu_mul` pass, not from the GEMV.
+1. **Split-KV decode attention (flash-decoding)** — Split the KV range across blocks, have each block load one KV head for all 4 of its Q heads, and merge the partial (m, l, O) in a second pass. Decode attention is 52–68% of GPU time per token at kv_len 1024–2048 and runs at ~9 GB/s ([Context length](#context-length)).
 
-2. **Launch overhead / host sync in decode** — 213 kernel launches per token plus a device→host argmax copy. GPU kernel time is still well below wall time per step, so CUDA Graphs (or a persistent kernel) is the next step.
+2. **Prefill attention: FlashAttention-lite v5 port** — Tensor Core (mma.sync) tiles with cp.async double buffering, adapted for a causal mask with tile skip, GQA, a query offset into the KV cache, and the `[seq, kv_heads·D]` cache layout. Prefill attention is 44–63% of a 1–2K-token prefill.
 
-3. **GEMM (prefill): shared tile reuse + double buffering** — Each warp in the wmma kernel loads its own A and B fragments, so the 16 warps in a block don't share tiles, and loads and MMAs run back to back. Block-level shared-memory tiles with double buffering would cut global traffic and hide load latency.
+3. **Fused gate/up projection** — Same idea for the MLP: one `[hidden, 2×intermediate]` GEMV, with SiLU×Mul folded into its epilogue. gate and up already run at ~92% of bandwidth, so the gain would come from one fewer launch and skipping the `silu_mul` pass, not from the GEMV.
 
-5. **GEMM: Swizzled shared memory** — Not yet profiled for bank conflicts. If ncu shows them on the staged path, XOR-swizzled layouts (as in CUTLASS) remove them.
+4. **Launch overhead / host sync in decode** — 213 kernel launches per token plus a device→host argmax copy. GPU kernel time is still well below wall time per step, so CUDA Graphs (or a persistent kernel) is the next step.
 
-6. **Flash Attention v2 optimizations** — The current implementation uses one block per (query, head) and no SRAM tiling. FA2 adds non-square tiles, warp specialization (producer/consumer), and pipelining within the K/V tile loop. It is 6.6% of decode GPU time now.
+5. **GEMM (prefill): shared tile reuse + double buffering** — Each warp in the wmma kernel loads its own A and B fragments, so the 16 warps in a block don't share tiles, and loads and MMAs run back to back. Block-level shared-memory tiles with double buffering would cut global traffic and hide load latency.
+
+6. **GEMM: Swizzled shared memory** — Not yet profiled for bank conflicts. If ncu shows them on the staged path, XOR-swizzled layouts (as in CUTLASS) remove them.
 
 7. **KV Cache quantization** — Storing the KV cache in INT8/FP8 would halve its memory and allow longer sequences. Requires dequantize-on-the-fly in the attention kernel.
 
