@@ -315,6 +315,171 @@ __global__ void flash_attention_gqa_kernel(
     }
 }
 
+// ============================================================
+//  5d: Split-KV decode attention (flash-decoding), seq_len = 1
+//
+//  The kernel above gives decode 32 blocks (one per Q head) of 64
+//  threads, each walking the whole KV range serially: at kv_len 2048
+//  a layer's 4.2 MB of K/V took ~465 us (~9 GB/s). Here:
+//
+//  Grid (kv_head, split), one warp per block. A block owns one KV
+//  head and all FD_G = 4 Q heads that share it (GQA), so every K/V
+//  row is read once, and a chunk of the KV range; chunks are sized
+//  so that long contexts get up to FD_MAX_SPLITS blocks per head.
+//    scores: lane l takes KV position base+l, reads its 128 B K row
+//            (8 × uint4) and dots it with the 4 Q heads (q·scale in smem)
+//    softmax: per-head running (m, l), warp max/sum via shuffles
+//    P·V:   lane owns dims 2l, 2l+1; for each position reads a half2
+//            of V (one 128 B row per warp) and gets p by shuffle
+//  Splits are merged like the GEMV's split-K: each block stores its
+//  (m, l, unnormalized O) per Q head, the last block of a KV head
+//  (atomic counter) rescales and sums them in split order. One
+//  launch, deterministic.
+// ============================================================
+
+constexpr int FD_D = 64;            // head_dim
+constexpr int FD_G = 4;             // Q heads per KV head
+constexpr int FD_TILE = 32;         // KV positions per warp step
+constexpr int FD_MAX_SPLITS = 64;
+constexpr int FD_MAX_KV_HEADS = 8;
+
+__device__ float    g_fd_o[FD_MAX_SPLITS * FD_MAX_KV_HEADS * FD_G * FD_D];
+__device__ float    g_fd_ml[FD_MAX_SPLITS * FD_MAX_KV_HEADS * FD_G * 2];
+__device__ unsigned g_fd_count[FD_MAX_KV_HEADS];
+
+__global__ void __launch_bounds__(32)
+flash_decode_kernel(half* __restrict__ O, const half* __restrict__ Q,
+                    const half* __restrict__ K, const half* __restrict__ V,
+                    int kv_len, int num_kv_heads, int chunk, float scale) {
+    const int kvh = blockIdx.x, split = blockIdx.y, nsplit = gridDim.y;
+    const int lane = threadIdx.x;
+    const int kv_stride = num_kv_heads * FD_D;
+    const int nqh = num_kv_heads * FD_G;
+    const int qh0 = kvh * FD_G;
+
+    __shared__ float q_s[FD_G][FD_D];
+    for (int i = lane; i < FD_G * FD_D; i += 32)
+        q_s[i / FD_D][i % FD_D] = __half2float(Q[qh0 * FD_D + i]) * scale;
+    __syncwarp();
+
+    float m[FD_G], l[FD_G], o[FD_G][2];
+    #pragma unroll
+    for (int h = 0; h < FD_G; h++) { m[h] = -FLT_MAX; l[h] = 0.0f; o[h][0] = o[h][1] = 0.0f; }
+
+    const half* Kh = K + kvh * FD_D;
+    const half* Vh = V + kvh * FD_D;
+    const int k0 = split * chunk;
+    const int k1 = min(kv_len, k0 + chunk);
+
+    for (int base = k0; base < k1; base += FD_TILE) {
+        const int j = base + lane;
+        const bool valid = j < k1;
+
+        // ---- scores for this lane's position, all 4 heads ----
+        float s[FD_G] = {};
+        if (valid) {
+            const uint4* krow = reinterpret_cast<const uint4*>(Kh + (size_t)j * kv_stride);
+            #pragma unroll
+            for (int c = 0; c < FD_D / 8; c++) {
+                uint4 kk = __ldg(krow + c);
+                const half2* k2 = reinterpret_cast<const half2*>(&kk);
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    float2 kf = __half22float2(k2[e]);
+                    const int d = c * 8 + e * 2;
+                    #pragma unroll
+                    for (int h = 0; h < FD_G; h++)
+                        s[h] = fmaf(q_s[h][d], kf.x, fmaf(q_s[h][d + 1], kf.y, s[h]));
+                }
+            }
+        }
+
+        // ---- online softmax update ----
+        float p[FD_G];
+        #pragma unroll
+        for (int h = 0; h < FD_G; h++) {
+            float tile_max = warp_reduce_max(valid ? s[h] : -FLT_MAX);
+            float m_new = fmaxf(m[h], tile_max);
+            float alpha = __expf(m[h] - m_new);
+            p[h] = valid ? __expf(s[h] - m_new) : 0.0f;
+            l[h] = l[h] * alpha + warp_reduce_sum(p[h]);
+            o[h][0] *= alpha;
+            o[h][1] *= alpha;
+            m[h] = m_new;
+        }
+
+        // ---- O += P · V over the tile's positions ----
+        const int n = min(FD_TILE, k1 - base);
+        const half* vrow = Vh + (size_t)base * kv_stride + lane * 2;
+        #pragma unroll 8
+        for (int jj = 0; jj < n; jj++) {
+            float2 v = __half22float2(*reinterpret_cast<const half2*>(vrow + (size_t)jj * kv_stride));
+            #pragma unroll
+            for (int h = 0; h < FD_G; h++) {
+                float pj = __shfl_sync(0xffffffffu, p[h], jj);
+                o[h][0] = fmaf(pj, v.x, o[h][0]);
+                o[h][1] = fmaf(pj, v.y, o[h][1]);
+            }
+        }
+    }
+
+    if (nsplit == 1) {
+        #pragma unroll
+        for (int h = 0; h < FD_G; h++) {
+            float inv = 1.0f / l[h];
+            *reinterpret_cast<half2*>(O + (qh0 + h) * FD_D + lane * 2) =
+                __floats2half2_rn(o[h][0] * inv, o[h][1] * inv);
+        }
+        return;
+    }
+
+    // ---- publish partials, last block of this KV head merges ----
+    #pragma unroll
+    for (int h = 0; h < FD_G; h++) {
+        const int idx = split * nqh + qh0 + h;
+        g_fd_o[idx * FD_D + lane * 2]     = o[h][0];
+        g_fd_o[idx * FD_D + lane * 2 + 1] = o[h][1];
+        if (lane == 0) { g_fd_ml[idx * 2] = m[h]; g_fd_ml[idx * 2 + 1] = l[h]; }
+    }
+    __threadfence();
+    __syncwarp();
+    unsigned done = 0;
+    if (lane == 0) done = atomicAdd(&g_fd_count[kvh], 1u);
+    done = __shfl_sync(0xffffffffu, done, 0);
+    if (done != (unsigned)nsplit - 1) return;
+
+    #pragma unroll
+    for (int h = 0; h < FD_G; h++) {
+        const int qh = qh0 + h;
+        float M = -FLT_MAX;
+        for (int sp = 0; sp < nsplit; sp++) M = fmaxf(M, __ldcg(&g_fd_ml[(sp * nqh + qh) * 2]));
+        float L = 0.0f, o0 = 0.0f, o1 = 0.0f;
+        for (int sp = 0; sp < nsplit; sp++) {
+            const int idx = sp * nqh + qh;
+            float w = __expf(__ldcg(&g_fd_ml[idx * 2]) - M);
+            L  += __ldcg(&g_fd_ml[idx * 2 + 1]) * w;
+            o0 += __ldcg(&g_fd_o[idx * FD_D + lane * 2]) * w;
+            o1 += __ldcg(&g_fd_o[idx * FD_D + lane * 2 + 1]) * w;
+        }
+        float inv = 1.0f / L;
+        *reinterpret_cast<half2*>(O + qh * FD_D + lane * 2) = __floats2half2_rn(o0 * inv, o1 * inv);
+    }
+    if (lane == 0) g_fd_count[kvh] = 0;  // ready for the next launch
+}
+
+bool flash_decode_supported(int num_q_heads, int num_kv_heads, int head_dim) {
+    return head_dim == FD_D && num_q_heads == FD_G * num_kv_heads && num_kv_heads <= FD_MAX_KV_HEADS;
+}
+
+void launch_flash_decode(half* out, const half* Q, const half* K, const half* V,
+                         int kv_len, int num_q_heads, int num_kv_heads, int head_dim, float scale) {
+    (void)num_q_heads; (void)head_dim;  // fixed by flash_decode_supported
+    // One 32-position tile per block until the split cap; longer contexts get longer chunks
+    int chunk = max(FD_TILE, cdiv(cdiv(kv_len, FD_MAX_SPLITS), FD_TILE) * FD_TILE);
+    dim3 grid(num_kv_heads, cdiv(kv_len, chunk));
+    flash_decode_kernel<<<grid, 32>>>(out, Q, K, V, kv_len, num_kv_heads, chunk, scale);
+}
+
 void launch_flash_attention_gqa(
     half* out, const half* Q, const half* K, const half* V,
     int seq_len, int kv_len,

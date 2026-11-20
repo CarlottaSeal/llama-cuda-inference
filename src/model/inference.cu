@@ -266,7 +266,13 @@ void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start
         // 2h. Attention: Q against full KV cache [0..kv_len)
         float scale = 1.0f / sqrtf((float)C::head_dim);
 
-        if (use_flash_) {
+        if (use_flash_ && seq_len == 1 &&
+            flash_decode_supported(C::num_q_heads, C::num_kv_heads, C::head_dim)) {
+            launch_flash_decode(
+                buf_.attn_out, buf_.q,
+                buf_.kv_cache_k[l], buf_.kv_cache_v[l],
+                kv_len, C::num_q_heads, C::num_kv_heads, C::head_dim, scale);
+        } else if (use_flash_) {
             launch_flash_attention_gqa(
                 buf_.attn_out, buf_.q,
                 buf_.kv_cache_k[l], buf_.kv_cache_v[l],

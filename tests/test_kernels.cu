@@ -1218,6 +1218,62 @@ bool test_flash_attention() {
 //  Test runner
 // ============================================================
 
+bool test_flash_decode() {
+    printf("Testing split-KV decode attention... ");
+
+    // Llama 3.2 1B head layout; kv lengths cover a partial single tile,
+    // tile boundaries, one tile per split, and chunks longer than a tile.
+    const int NQH = 32, NKVH = 8, HD = 64;
+    const float SCALE = 1.0f / sqrtf((float)HD);
+    const int kv_lens[] = {1, 7, 32, 33, 100, 1000, 2048, 3000};
+    TEST_ASSERT(flash_decode_supported(NQH, NKVH, HD), "decode shape not supported");
+
+    for (int KV : kv_lens) {
+        const size_t q_n = NQH * HD, kv_n = (size_t)KV * NKVH * HD;
+        std::vector<float> h_Q(q_n), h_K(kv_n), h_V(kv_n);
+        for (size_t i = 0; i < q_n; i++)  h_Q[i] = (int)((i * 37 + 11) % 401) * 0.005f - 1.0f;
+        for (size_t i = 0; i < kv_n; i++) h_K[i] = (int)((i * 53 + 7) % 397) * 0.005f - 1.0f;
+        for (size_t i = 0; i < kv_n; i++) h_V[i] = (int)((i * 29 + 3) % 389) * 0.005f - 1.0f;
+        auto h_Q_h = to_half(h_Q), h_K_h = to_half(h_K), h_V_h = to_half(h_V);
+
+        // Reference on the FP16-rounded inputs
+        std::vector<float> ref(q_n);
+        cpu_attention(ref, to_float(h_Q_h), to_float(h_K_h), to_float(h_V_h),
+                      1, KV, NQH, NKVH, HD, SCALE);
+
+        half *d_Q, *d_K, *d_V, *d_O;
+        CUDA_CHECK(cudaMalloc(&d_Q, q_n * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_K, kv_n * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_V, kv_n * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_O, q_n * sizeof(half)));
+        CUDA_CHECK(cudaMemcpy(d_Q, h_Q_h.data(), q_n * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_K, h_K_h.data(), kv_n * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_V, h_V_h.data(), kv_n * sizeof(half), cudaMemcpyHostToDevice));
+
+        // Twice: the split counter must reset, and the merge order is fixed
+        std::vector<half> o1(q_n), o2(q_n);
+        for (int rep = 0; rep < 2; rep++) {
+            CUDA_CHECK(cudaMemset(d_O, 0xff, q_n * sizeof(half)));
+            launch_flash_decode(d_O, d_Q, d_K, d_V, KV, NQH, NKVH, HD, SCALE);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(rep ? o2.data() : o1.data(), d_O, q_n * sizeof(half), cudaMemcpyDeviceToHost));
+        }
+        cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O);
+
+        for (size_t i = 0; i < q_n; i++) {
+            float got = __half2float(o1[i]);
+            if (!(fabsf(got - ref[i]) <= 2e-3f + fabsf(ref[i]) * 2e-3f)) {
+                fprintf(stderr, "  kv=%d mismatch at %zu: got %f, expected %f\n", KV, i, got, ref[i]);
+                return false;
+            }
+            TEST_ASSERT(memcmp(&o1[i], &o2[i], sizeof(half)) == 0, "decode attention not deterministic");
+        }
+    }
+
+    printf("PASSED\n");
+    return true;
+}
+
 int main() {
     printf("=== Kernel Unit Tests ===\n\n");
 
@@ -1255,6 +1311,7 @@ int main() {
     // M5: Attention
     run(test_attention_naive, "Attention Naive");
     run(test_flash_attention, "Flash Attention");
+    run(test_flash_decode,    "Split-KV decode attention");
 
     printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);
     return (failed > 0) ? 1 : 0;

@@ -11,8 +11,9 @@ capital and largest city. Paris is the most populous urban area in the European 
 
 **Status:** runs the official `meta-llama/Llama-3.2-1B` checkpoint end to end. Greedy output
 matches HF `transformers` token for token on the prompts checked (see [Correctness](#correctness)).
-Every kernel is also unit-tested against a CPU reference (14 tests), and the forward pass runs
-clean under `compute-sanitizer`. Decode runs at ~237 tok/s (128 tokens). It started at ~14.6:
+Every kernel is also unit-tested against a CPU reference (15 tests), and the forward pass runs
+clean under `compute-sanitizer`. Decode runs at ~200–237 tok/s at 128 tokens and ~225 tok/s over a
+full 2K context. A split-KV decode attention kernel keeps long contexts from slowing it down. It started at ~14.6:
 transposing weights at load time brought it to ~51, a dedicated M=1 GEMV to ~200, and fusing
 Q/K/V into one projection added ~6%. The large decode projections stream weights at 92–95% of
 DRAM bandwidth; see [Performance](#performance).
@@ -54,7 +55,8 @@ Every kernel is written from first principles. Three optimization levels for GEM
 | **GEMM wmma** | `gemm.cu` | Tensor Core 16×16×16 | `nvcuda::wmma` fragments, 4×4 warp grid, FP16→FP32 accumulate |
 | **Decode GEMV** | `gemm.cu` | 64 columns per block, split-K | 128-bit weight loads, block reduce, last-block split-K reduction (one launch, deterministic) |
 | **Attention Naive** | `attention.cu` | Materialize S matrix | 3-pass (QK^T → causal mask + softmax → SV), shmem for scores |
-| **Flash Attention** | `attention.cu` | Online softmax over KV tiles | KV tiles of 32, running (m, l, O) — O(head_dim) memory per block |
+| **Flash Attention** | `attention.cu` | Online softmax over KV tiles | KV tiles of 32, running (m, l, O) — O(head_dim) memory per block (prefill) |
+| **Split-KV decode attention** | `attention.cu` | (KV head, KV chunk) per warp | All 4 GQA Q heads per K/V read, 128-bit K rows, last-block merge of (m, l, O) (decode) |
 
 ### GEMM Optimization Path
 
@@ -111,7 +113,24 @@ O = O / l                                  // final normalize
 
 Memory usage: O(head_dim) per thread block vs O(kv_len) for naive — critical for long sequences.
 
-One block handles one (query, head) pair, and K/V rows are read from global memory as each tile is processed rather than staged in shared memory, so this is the online-softmax half of FlashAttention without its SRAM tiling.
+One block handles one (query, head) pair, and K/V rows are read from global memory as each tile is processed rather than staged in shared memory, so this is the online-softmax half of FlashAttention without its SRAM tiling. Prefill still uses it. Decode uses the kernel below.
+
+### Split-KV Decode Attention
+
+At decode there is one query per head. The kernel above then has only 32 blocks, which walk the whole KV range serially. That cost grows linearly with context: 465 µs per layer at kv_len 2032 ([Context length](#context-length)). `flash_decode_kernel` is flash-decoding adapted to GQA:
+
+```
+grid = (kv_head, split), one warp per block; chunk = max(32, kv_len/64 rounded up to 32)
+q·scale for the 4 Q heads of this KV head → shmem
+for each 32-position tile in this block's chunk:
+    lane l: K row (base+l), 8 × uint4 → s[h] = q_h·k for h = 0..3       // each K row read once for 4 heads
+    per head: m, l, O rescaled with warp max/sum (online softmax)
+    lane l owns dims 2l, 2l+1: for each position j: O_h += p_h[j] · V[j]  // p broadcast by shuffle
+store (m, l, O) per Q head; the last block of this KV head (atomic counter)
+    merges the splits in order: O = Σ e^(m_s−M) O_s / Σ e^(m_s−M) l_s
+```
+
+At kv_len 2048 that is 64 splits × 8 KV heads = 512 single-warp blocks, against 32 before. The merge is in-kernel and in fixed split order, the same scheme as the GEMV's split-K: one launch, bit-identical across runs (unit-tested with kv_len from 1 to 3000).
 
 **GQA (Grouped Query Attention)**: 32 Q heads share 8 KV heads (4:1 ratio). Mapping: `kv_head = q_head / 4`.
 
@@ -325,31 +344,46 @@ In the GEMV build the GPU kernel mix is GEMV 82.7%, attention 6.6%, the prefill 
 RMSNorm 3.4%, and argmax 1.6% (one ~70 µs launch per token).
 
 What's left: the weights are now read at ~91% of bandwidth overall, so further kernel-side gains
-are small: fusing gate/up (item 3 below) saves one launch and a pass over `gate`/`up`. The
+are small: fusing gate/up (item 2 below) saves one launch and a pass over `gate`/`up`. The
 larger gap is between GPU kernel time and wall time: launch overhead and the host round trip per token.
 
 ### Context length
 
-The tables above use a 6-token prompt, so attention barely shows up. With longer contexts it takes
-over, in both phases (fused-QKV build, nsys).
+The tables above use a 6-token prompt, so attention barely shows up. With the generic flash
+attention kernel it took over at longer contexts, in both phases (nsys). Decode now has its own
+kernel; prefill attention is still the generic one.
 
 **Decode**: one run from a 6-token prompt to kv_len 2048. Each decode step is matched to its kv_len,
-and each row is the median over steps within ±16:
+and each row is the median over steps within ±16. "Before" is the fused-QKV build (`b083602`), which
+used the generic flash attention kernel for decode too; "after" adds the split-KV decode kernel:
 
-| kv_len | Attention / token | GPU time / token | Attention share | Attention / layer |
-|--------|-------------------|------------------|-----------------|-------------------|
-| 64   | 0.28 ms | 3.61 ms  | 7.9%  | 17.8 µs |
-| 128  | 0.50 ms | 3.84 ms  | 13.1% | 31.4 µs |
-| 256  | 0.97 ms | 4.29 ms  | 22.6% | 60.8 µs |
-| 512  | 1.88 ms | 5.21 ms  | 36.1% | 118 µs |
-| 1024 | 3.82 ms | 7.27 ms  | 52.5% | 239 µs |
-| 1536 | 5.50 ms | 8.82 ms  | 62.3% | 344 µs |
-| 2032 | 7.44 ms | 10.98 ms | 67.8% | 465 µs |
+| kv_len | Attention / token (before → after) | GPU time / token (before → after) | Attention share | Attention / layer |
+|--------|------------------------------------|-----------------------------------|-----------------|-------------------|
+| 64   | 0.28 → 0.12 ms | 3.61 → 3.45 ms  | 7.9% → 3.4%  | 17.8 → 7.3 µs |
+| 128  | 0.50 → 0.12 ms | 3.84 → 3.44 ms  | 13.1% → 3.5% | 31.4 → 7.5 µs |
+| 256  | 0.97 → 0.14 ms | 4.29 → 3.47 ms  | 22.6% → 4.1% | 60.8 → 8.9 µs |
+| 512  | 1.88 → 0.18 ms | 5.21 → 3.51 ms  | 36.1% → 5.2% | 118 → 11.4 µs |
+| 1024 | 3.82 → 0.25 ms | 7.27 → 3.60 ms  | 52.5% → 7.0% | 239 → 15.8 µs |
+| 1536 | 5.50 → 0.33 ms | 8.82 → 3.90 ms  | 62.3% → 8.4% | 344 → 20.4 µs |
+| 2032 | 7.44 → 0.39 ms | 10.98 → 3.73 ms | 67.8% → 10.5% | 465 → 24.5 µs |
 
-At kv_len 2032 a layer's K and V are 4.2 MB, read in 465 µs: ~9 GB/s, two orders of magnitude
-below what the GEMVs reach. The decode attention launches one block per (query, head), so 32
-blocks, and each walks the whole KV range serially. It is latency-bound, not bandwidth-bound.
-Each KV head is also read by 4 separate Q-head blocks.
+The old kernel launched one block per (query, head): 32 blocks of 64 threads, each walking the
+whole KV range serially, and each KV head read by 4 separate Q-head blocks. At kv_len 2032 a
+layer's K and V are 4.2 MB, read in 465 µs: ~9 GB/s, latency-bound. The split-KV kernel
+([design](#split-kv-decode-attention)) reads the same 4.2 MB in 24.5 µs, ~171 GB/s. That is still
+well under DRAM bandwidth, but attention is now ~10% of a step even at 2K context. The ~7 µs floor
+at short contexts is one launch plus the in-kernel merge.
+
+End to end (3 runs each, interleaved with `b083602`, both builds checked idle before and after every run):
+
+| Generated tokens | Before | After |
+|------------------|--------|-------|
+| 32   | 130.0–181.8 tok/s | 132.3–196.8 tok/s |
+| 128  | 191.0–211.1 tok/s | 197.6–209.1 tok/s |
+| 2042 | 124.7–125.1 tok/s | **224.1–226.9 tok/s** (1.80×) |
+
+At 32 and 128 tokens the difference (~0.16 ms/step) is inside run-to-run noise. Generated text is
+identical between the builds, including the 2042-token run (7,876 characters).
 
 **Prefill**: prompts of repeated text, generating 1 token. Wall time is from 3 plain runs; the
 kernel split is from one nsys run of the prefill forward:
@@ -377,26 +411,25 @@ Done:
 - **Weight pre-transpose** (see [Weight Transpose at Load Time](#weight-transpose-at-load-time)): 3.5× decode.
 - **Decode GEMV** (see [GEMM Optimization Path](#gemm-optimization-path)): another 2.9–4.2× decode. The large projections run at 92–95% of DRAM bandwidth.
 - **Fused QKV projection**: W_q | W_k | W_v concatenated at load time into one `[hidden, 3072]` matrix. A split kernel writes Q to its buffer and K/V straight into the KV cache, which replaces the two cache copies. +5.6% decode, −4 ms prefill.
+- **Split-KV decode attention** (see [Split-KV Decode Attention](#split-kv-decode-attention)): decode attention at kv_len 2032 goes from 465 to 24.5 µs per layer, and 2K-context decode from ~125 to ~225 tok/s.
 
 Not implemented yet, in the order the measurements suggest:
 
-1. **Split-KV decode attention (flash-decoding)** — Split the KV range across blocks, have each block load one KV head for all 4 of its Q heads, and merge the partial (m, l, O) in a second pass. Decode attention is 52–68% of GPU time per token at kv_len 1024–2048 and runs at ~9 GB/s ([Context length](#context-length)).
+1. **Prefill attention: FlashAttention-lite v5 port** — Tensor Core (mma.sync) tiles with cp.async double buffering, adapted for a causal mask with tile skip, GQA, a query offset into the KV cache, and the `[seq, kv_heads·D]` cache layout. Prefill attention is 44–63% of a 1–2K-token prefill.
 
-2. **Prefill attention: FlashAttention-lite v5 port** — Tensor Core (mma.sync) tiles with cp.async double buffering, adapted for a causal mask with tile skip, GQA, a query offset into the KV cache, and the `[seq, kv_heads·D]` cache layout. Prefill attention is 44–63% of a 1–2K-token prefill.
+2. **Fused gate/up projection** — Same idea for the MLP: one `[hidden, 2×intermediate]` GEMV, with SiLU×Mul folded into its epilogue. gate and up already run at ~92% of bandwidth, so the gain would come from one fewer launch and skipping the `silu_mul` pass, not from the GEMV.
 
-3. **Fused gate/up projection** — Same idea for the MLP: one `[hidden, 2×intermediate]` GEMV, with SiLU×Mul folded into its epilogue. gate and up already run at ~92% of bandwidth, so the gain would come from one fewer launch and skipping the `silu_mul` pass, not from the GEMV.
+3. **Launch overhead / host sync in decode** — 213 kernel launches per token plus a device→host argmax copy. GPU kernel time is still well below wall time per step, so CUDA Graphs (or a persistent kernel) is the next step.
 
-4. **Launch overhead / host sync in decode** — 213 kernel launches per token plus a device→host argmax copy. GPU kernel time is still well below wall time per step, so CUDA Graphs (or a persistent kernel) is the next step.
+4. **GEMM (prefill): shared tile reuse + double buffering** — Each warp in the wmma kernel loads its own A and B fragments, so the 16 warps in a block don't share tiles, and loads and MMAs run back to back. Block-level shared-memory tiles with double buffering would cut global traffic and hide load latency.
 
-5. **GEMM (prefill): shared tile reuse + double buffering** — Each warp in the wmma kernel loads its own A and B fragments, so the 16 warps in a block don't share tiles, and loads and MMAs run back to back. Block-level shared-memory tiles with double buffering would cut global traffic and hide load latency.
+5. **GEMM: Swizzled shared memory** — Not yet profiled for bank conflicts. If ncu shows them on the staged path, XOR-swizzled layouts (as in CUTLASS) remove them.
 
-6. **GEMM: Swizzled shared memory** — Not yet profiled for bank conflicts. If ncu shows them on the staged path, XOR-swizzled layouts (as in CUTLASS) remove them.
+6. **KV Cache quantization** — Storing the KV cache in INT8/FP8 would halve its memory and allow longer sequences. Requires dequantize-on-the-fly in the attention kernel.
 
-7. **KV Cache quantization** — Storing the KV cache in INT8/FP8 would halve its memory and allow longer sequences. Requires dequantize-on-the-fly in the attention kernel.
+7. **PagedAttention** — The current contiguous KV cache wastes memory on short sequences. Paged allocation (vLLM-style) enables efficient batching of variable-length sequences.
 
-8. **PagedAttention** — The current contiguous KV cache wastes memory on short sequences. Paged allocation (vLLM-style) enables efficient batching of variable-length sequences.
-
-9. **Speculative decoding** — A smaller draft model proposes tokens, and the full model verifies them in parallel. Reported to give 2–3× effective decode speedup.
+8. **Speculative decoding** — A smaller draft model proposes tokens, and the full model verifies them in parallel. Reported to give 2–3× effective decode speedup.
 
 ## Limitations
 
