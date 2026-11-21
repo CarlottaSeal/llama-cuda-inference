@@ -11,13 +11,13 @@ capital and largest city. Paris is the most populous urban area in the European 
 
 **Status:** runs the official `meta-llama/Llama-3.2-1B` checkpoint end to end. Greedy output
 matches HF `transformers` token for token on the prompts checked (see [Correctness](#correctness)).
-Every kernel is also unit-tested against a CPU reference (16 tests), and the forward pass runs
+Every kernel is also unit-tested against a CPU reference (17 tests), and the forward pass runs
 clean under `compute-sanitizer`. Decode runs at ~200–237 tok/s at 128 tokens and ~225 tok/s over a
 full 2K context. A split-KV decode attention kernel keeps long contexts from slowing it down. It started at ~14.6:
-transposing weights at load time brought it to ~51, a dedicated M=1 GEMV to ~200, and fusing
-Q/K/V into one projection added ~6%. The large decode projections stream weights at 92–95% of
+transposing weights at load time brought it to ~51, a dedicated M=1 GEMV to ~200, fusing
+Q/K/V into one projection added ~6%, and fusing gate/up another ~2%. The large decode projections stream weights at 92–95% of
 DRAM bandwidth. Prefill attention runs on Tensor Cores (a port of the author's FlashAttention-lite
-v5), so a 2K-token prefill takes ~275 ms instead of ~715 ms; see [Performance](#performance).
+v5), and with gate/up fused a 2K-token prefill takes ~236 ms, down from ~715 ms; see [Performance](#performance).
 
 ## Architecture
 
@@ -31,8 +31,7 @@ Token IDs ──► Embedding Lookup ──► hidden[seq, 2048]
      │                                                ├─ K ──► KV Cache ──► RoPE (in place) ──►├─► Attention ──► O Proj ──► + residual
      │                                                └─ V ──► KV Cache ─────────────────────┘
      │
-     └─── RMSNorm ───► Gate Proj ──┐
-                       Up Proj ───►├─► SiLU×Mul ──► Down Proj ──► + residual
+     └─── RMSNorm ───► Gate|Up Proj (one GEMM/GEMV) ──► SiLU×Mul ──► Down Proj ──► + residual
                                    │
               ┌────────────────────┘
               ▼
@@ -47,7 +46,7 @@ Every kernel is written from first principles. Three optimization levels for GEM
 |--------|------|----------|---------------|
 | **Embedding** | `embedding.cu` | 1 thread per element | Coalesced lookup from [vocab, hidden] table |
 | **Residual Add** | `residual.cu` | 1 thread per element | In-place a += b, vectorizable |
-| **SiLU×Mul** | `silu.cu` | 1 thread per element | Fused σ(x)·x·y, FP32 intermediate |
+| **SiLU×Mul** | `silu.cu` | 1 thread per element | Fused σ(x)·x·y, FP32 intermediate; prefill reads the interleaved gate/up GEMM output (decode folds it into the GEMV) |
 | **RMSNorm** | `rmsnorm.cu` | 1 block per row | Warp shuffle `__shfl_xor_sync` → block reduce via shmem |
 | **Softmax** | `softmax.cu` | 1 block per row | 3-pass: max → exp+sum → normalize; numerically stable |
 | **RoPE** | `rope.cu` | 1 thread per dim pair | HF rotate_half pairing (i, i+d/2), Llama 3 frequency scaling |
@@ -363,8 +362,51 @@ In the GEMV build the GPU kernel mix is GEMV 82.7%, attention 6.6%, the prefill 
 RMSNorm 3.4%, and argmax 1.6% (one ~70 µs launch per token).
 
 What's left: the weights are now read at ~91% of bandwidth overall, so further kernel-side gains
-are small: fusing gate/up (item 1 under [Known Optimization Opportunities](#known-optimization-opportunities)) saves one launch and a pass over `gate`/`up`. The
-larger gap is between GPU kernel time and wall time: launch overhead and the host round trip per token.
+are small. The larger gap is between GPU kernel time and wall time: launch overhead and the host
+round trip per token.
+
+### Fused gate/up projection
+
+`W_gate` and `W_up` are interleaved at load time into one `[2048, 16384]` matrix in groups of 32
+columns (`g[0:32] u[0:32] g[32:64] u[32:64] …`), so each 64-column GEMV block holds 32 gate
+outputs and their 32 up outputs. Decode runs one GEMV whose epilogue writes `silu(g)·u` directly
+(after the split-K merge when K is split), and `silu_mul` and one GEMV launch disappear: 32 fewer
+kernels per token (nsys, 128-token run: 229 → 197 kernels per forward on average). Prefill runs one wmma GEMM into a `[seq, 16384]` buffer and an
+`silu_mul` variant that reads the interleaved layout. g and u are rounded to FP16 before the
+SwiGLU, as in the unfused path. The unit test checks that prefill output matches the unfused
+path bit for bit. Weight memory is unchanged (2858 MB). Load time goes from 7.89–7.97 s to
+8.26–8.36 s (2 runs each) because of the extra host-side interleave copy.
+
+Kernel medians (nsys, per layer):
+
+| | Before (`a7d9040`) | After |
+|---|---|---|
+| decode gate + up GEMV | 41.4 + 41.4 µs (grid 128×3 each) | 82.2 µs (grid 256×2) |
+| decode `silu_mul` | separate launch | in the GEMV epilogue |
+| prefill gate + up wmma, 2002 tokens | 4266 + 4266 µs | **6451 µs** |
+| prefill SwiGLU, 2002 tokens | 220 µs | 125 µs |
+
+The decode GEMV takes the same time (it was already at ~92% of bandwidth), so the decode gain is
+the two launches. The prefill GEMM gain was not expected and hasn't been analyzed. One N=16384
+launch takes 24% less time than two N=8192 launches over the same A.
+
+End to end, interleaved with `a7d9040`, 3 s idle before every run:
+
+| | Before | After |
+|---|---|---|
+| decode, 32 tokens (5 runs) | 244.5–245.2 tok/s | 244.9–250.6 tok/s |
+| decode, 128 tokens (5 runs) | 240.7–243.4 tok/s | **247.0–248.5 tok/s** (+2.4%) |
+| prefill 132 tokens (6 runs) | 24.9–25.9 ms | 25.2–26.2 ms |
+| prefill 262 tokens (6 runs) | 42.4–43.3 ms | 41.0–41.9 ms |
+| prefill 512 tokens (3 runs) | 64.6–66.0 ms | 57.4–57.7 ms |
+| prefill 1022 tokens (3 runs) | 150.9–153.1 ms | 137.7–138.7 ms |
+| prefill 2002 tokens (3 runs) | 269.2–271.3 ms | **235.6–236.9 ms** (−12.6%) |
+
+At 128 tokens that is 4.13 → 4.03 ms per step, ~6 µs per layer, more than the ~0.6 µs of GEMV
+kernel time saved. Prompts of 132 tokens or fewer are unchanged within noise. Generated text is
+identical on both [Correctness](#correctness) prompts and the 2002-token prompt. 17/17 unit tests
+pass, and `compute-sanitizer` memcheck and synccheck report 0 errors on a 132-token prefill plus 3
+decode steps.
 
 ### Context length
 
@@ -440,7 +482,7 @@ row is mostly noise. Kernel time at 2002 tokens (nsys, one prefill forward):
 | `gemm_wmma_kernel` (80 launches) | 259.3 ms | 259.6 ms (95.4%) |
 
 Causal attention at 2002 tokens is ~0.26 TFLOP, so the new kernel runs at ~67 TFLOPS, the same
-range as FA-lite's own non-causal benchmark. Prefill is now almost entirely the wmma GEMM (item 3 under [Known Optimization Opportunities](#known-optimization-opportunities)).
+range as FA-lite's own non-causal benchmark. Prefill is now almost entirely the wmma GEMM (item 2 under [Known Optimization Opportunities](#known-optimization-opportunities)).
 
 Generated text is identical to `eb370e7` on both [Correctness](#correctness) prompts and on the
 2002-token prompt (64 generated tokens). Decode doesn't touch the new kernel (seq_len 1 goes to split-KV).
@@ -462,22 +504,21 @@ Done:
 - **Fused QKV projection**: W_q | W_k | W_v concatenated at load time into one `[hidden, 3072]` matrix. A split kernel writes Q to its buffer and K/V straight into the KV cache, which replaces the two cache copies. +5.6% decode, −4 ms prefill.
 - **Split-KV decode attention** (see [Split-KV Decode Attention](#split-kv-decode-attention)): decode attention at kv_len 2032 goes from 465 to 24.5 µs per layer, and 2K-context decode from ~125 to ~225 tok/s.
 - **Tensor Core prefill attention** (see [Tensor Core Prefill Attention](#tensor-core-prefill-attention)): FlashAttention-lite v5 ported with causal tile skip, GQA, query offset and strided KV. Prefill attention at 2002 tokens goes from 448 to 3.9 ms, and the 2K-token prefill from ~715 to ~275 ms.
+- **Fused gate/up projection** (see [Fused gate/up projection](#fused-gategup-projection)): W_gate and W_up interleaved in 32-column groups; decode runs one GEMV with SwiGLU in its epilogue, prefill one wmma GEMM. +2.4% decode at 128 tokens, −12.6% prefill at 2002 tokens.
 
 Not implemented yet, in the order the measurements suggest:
 
-1. **Fused gate/up projection** — Same idea for the MLP: one `[hidden, 2×intermediate]` GEMV, with SiLU×Mul folded into its epilogue. gate and up already run at ~92% of bandwidth, so the gain would come from one fewer launch and skipping the `silu_mul` pass, not from the GEMV.
+1. **Launch overhead / host sync in decode** — ~197 kernel launches per token (nsys average per forward) plus a device→host argmax copy. GPU kernel time is still well below wall time per step, so CUDA Graphs (or a persistent kernel) is the next step.
 
-2. **Launch overhead / host sync in decode** — 213 kernel launches per token plus a device→host argmax copy. GPU kernel time is still well below wall time per step, so CUDA Graphs (or a persistent kernel) is the next step.
+2. **GEMM (prefill): shared tile reuse + double buffering** — ~95% of a 2K-token prefill's GPU time. With gate/up fused, the same work in one launch twice as wide took 24% less time, which isn't explained yet; ncu on this kernel is the first step. Each warp in the wmma kernel loads its own A and B fragments, so the 16 warps in a block don't share tiles, and loads and MMAs run back to back. Block-level shared-memory tiles with double buffering would cut global traffic and hide load latency.
 
-3. **GEMM (prefill): shared tile reuse + double buffering** — Now 95% of a 2K-token prefill's GPU time, at ~15 TFLOPS. Each warp in the wmma kernel loads its own A and B fragments, so the 16 warps in a block don't share tiles, and loads and MMAs run back to back. Block-level shared-memory tiles with double buffering would cut global traffic and hide load latency.
+3. **GEMM: Swizzled shared memory** — Not yet profiled for bank conflicts. If ncu shows them on the staged path, XOR-swizzled layouts (as in CUTLASS, and as the prefill attention kernel already uses) remove them.
 
-4. **GEMM: Swizzled shared memory** — Not yet profiled for bank conflicts. If ncu shows them on the staged path, XOR-swizzled layouts (as in CUTLASS, and as the prefill attention kernel already uses) remove them.
+4. **KV Cache quantization** — Storing the KV cache in INT8/FP8 would halve its memory and allow longer sequences. Requires dequantize-on-the-fly in the attention kernel.
 
-5. **KV Cache quantization** — Storing the KV cache in INT8/FP8 would halve its memory and allow longer sequences. Requires dequantize-on-the-fly in the attention kernel.
+5. **PagedAttention** — The current contiguous KV cache wastes memory on short sequences. Paged allocation (vLLM-style) enables efficient batching of variable-length sequences.
 
-6. **PagedAttention** — The current contiguous KV cache wastes memory on short sequences. Paged allocation (vLLM-style) enables efficient batching of variable-length sequences.
-
-7. **Speculative decoding** — A smaller draft model proposes tokens, and the full model verifies them in parallel. Reported to give 2–3× effective decode speedup.
+6. **Speculative decoding** — A smaller draft model proposes tokens, and the full model verifies them in parallel. Reported to give 2–3× effective decode speedup.
 
 ## Limitations
 

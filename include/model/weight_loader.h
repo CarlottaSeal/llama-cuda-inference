@@ -20,8 +20,7 @@
 //    lm_head.weight                      → lm_head
 //    model.layers.{i}.self_attn.{q,k,v}_proj.weight → layers[i].qkv_proj (fused)
 //    model.layers.{i}.self_attn.o_proj.weight   → layers[i].o_proj
-//    model.layers.{i}.mlp.gate_proj.weight      → layers[i].gate_proj
-//    model.layers.{i}.mlp.up_proj.weight        → layers[i].up_proj
+//    model.layers.{i}.mlp.{gate,up}_proj.weight → layers[i].gate_up_proj (interleaved)
 //    model.layers.{i}.mlp.down_proj.weight      → layers[i].down_proj
 //    model.layers.{i}.input_layernorm.weight     → layers[i].attn_norm
 //    model.layers.{i}.post_attention_layernorm.weight → layers[i].ffn_norm
@@ -59,6 +58,11 @@ private:
     // into one [K, ΣN_i] GPU tensor.
     half* load_fused(SafetensorsFile& file, const std::vector<std::string>& names,
                      const std::vector<size_t>& cols, size_t K);
+
+    // Transpose two [N, K] HF weights and interleave their columns in groups
+    // of `group`: [K, 2N] = a[0:g] b[0:g] a[g:2g] b[g:2g] ...
+    half* load_interleaved(SafetensorsFile& file, const std::string& name_a,
+                           const std::string& name_b, size_t N, size_t K, size_t group);
 
     half* upload(const std::vector<half>& host);
 };

@@ -50,8 +50,8 @@ struct LlamaLayerWeights {
     half* o_proj;       // [q_dim, hidden_size]
 
     // FFN (SwiGLU)
-    half* gate_proj;    // [hidden_size, intermediate_size]
-    half* up_proj;      // [hidden_size, intermediate_size]
+    half* gate_up_proj; // [hidden_size, 2*intermediate_size]: W_gate and W_up columns
+                        // interleaved in groups of GATE_UP_GROUP (32), see kernels.cuh
     half* down_proj;    // [intermediate_size, hidden_size]
 
     // Norms

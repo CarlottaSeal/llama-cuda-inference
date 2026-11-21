@@ -1,5 +1,6 @@
 #include "model/weight_loader.h"
 #include "utils/cuda_utils.cuh"
+#include "kernels/kernels.cuh"  // GATE_UP_GROUP
 
 #include <cstdio>
 #include <cstring>
@@ -59,6 +60,26 @@ half* WeightLoader::load_fused(SafetensorsFile& file,
         for (size_t k = 0; k < K; k++)
             std::memcpy(&fused[k * total_cols + col0], &part[k * cols[i]], cols[i] * sizeof(half));
         col0 += cols[i];
+    }
+    return upload(fused);
+}
+
+half* WeightLoader::load_interleaved(SafetensorsFile& file, const std::string& name_a,
+                                      const std::string& name_b, size_t N, size_t K, size_t group) {
+    if (N % group != 0) {
+        error_ = "Interleave group does not divide " + name_a;
+        return nullptr;
+    }
+    std::vector<half> a, b;
+    if (!read_tensor(file, name_a, K * N, /*transpose=*/true, a)) return nullptr;
+    if (!read_tensor(file, name_b, K * N, /*transpose=*/true, b)) return nullptr;
+    std::vector<half> fused(K * 2 * N);
+    for (size_t k = 0; k < K; k++) {
+        half* row = &fused[k * 2 * N];
+        for (size_t c = 0; c < N; c += group) {
+            std::memcpy(row + 2 * c,         &a[k * N + c], group * sizeof(half));
+            std::memcpy(row + 2 * c + group, &b[k * N + c], group * sizeof(half));
+        }
     }
     return upload(fused);
 }
@@ -190,13 +211,10 @@ bool WeightLoader::load(const std::string& model_dir, LlamaWeights& weights) {
                                     C::q_dim * C::hidden_size, /*transpose=*/true);
         if (!layer.o_proj) return false;
 
-        layer.gate_proj = load_tensor(file, prefix + "mlp.gate_proj.weight",
-                                       C::hidden_size * C::intermediate_size, /*transpose=*/true);
-        if (!layer.gate_proj) return false;
-
-        layer.up_proj = load_tensor(file, prefix + "mlp.up_proj.weight",
-                                     C::hidden_size * C::intermediate_size, /*transpose=*/true);
-        if (!layer.up_proj) return false;
+        layer.gate_up_proj = load_interleaved(file, prefix + "mlp.gate_proj.weight",
+                                              prefix + "mlp.up_proj.weight",
+                                              C::intermediate_size, C::hidden_size, GATE_UP_GROUP);
+        if (!layer.gate_up_proj) return false;
 
         layer.down_proj = load_tensor(file, prefix + "mlp.down_proj.weight",
                                        C::intermediate_size * C::hidden_size, /*transpose=*/true);

@@ -149,7 +149,7 @@ bool LlamaInference::init(int max_seq_len) {
     alloc(&buf_.qkv,     (size_t)max_seq_ * C::qkv_dim, "qkv");
     alloc(&buf_.attn_out,(size_t)max_seq_ * C::q_dim, "attn_out");
     alloc(&buf_.gate,    (size_t)max_seq_ * C::intermediate_size, "gate");
-    alloc(&buf_.up,      (size_t)max_seq_ * C::intermediate_size, "up");
+    alloc(&buf_.gate_up, (size_t)max_seq_ * 2 * C::intermediate_size, "gate_up");
     alloc(&buf_.ffn_out, (size_t)max_seq_ * C::hidden_size, "ffn_out");
 
     // Logits are only computed for the last token
@@ -182,7 +182,7 @@ void LlamaInference::cleanup() {
     free_ptr(buf_.qkv);
     free_ptr(buf_.attn_out);
     free_ptr(buf_.gate);
-    free_ptr(buf_.up);
+    free_ptr(buf_.gate_up);
     free_ptr(buf_.ffn_out);
     free_ptr(buf_.logits_half);
     free_ptr(buf_.logits);
@@ -304,20 +304,22 @@ void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start
         launch_rmsnorm(buf_.hidden2, buf_.hidden, layer.ffn_norm,
                        seq_len, C::hidden_size, C::rms_norm_eps);
 
-        // 2l. Gate projection: gate[seq, intermediate] = hidden2 × W_gate^T
-        gemm(buf_.gate, buf_.hidden2, layer.gate_proj, seq_len, C::intermediate_size, C::hidden_size);
+        // 2l. Fused gate/up projection + SiLU(gate) × up → gate[seq, intermediate]
+        if (seq_len == 1 && gemv_supported(2 * C::intermediate_size)) {
+            // Decode: one GEMV over the interleaved W_gate|W_up, SwiGLU in its epilogue
+            launch_gemv_swiglu(buf_.gate, buf_.hidden2, layer.gate_up_proj,
+                               C::intermediate_size, C::hidden_size);
+        } else {
+            // Prefill: one GEMM into gate_up[seq, 2·intermediate], then SwiGLU
+            gemm(buf_.gate_up, buf_.hidden2, layer.gate_up_proj,
+                 seq_len, 2 * C::intermediate_size, C::hidden_size);
+            launch_silu_mul_interleaved(buf_.gate, buf_.gate_up, seq_len, C::intermediate_size);
+        }
 
-        // 2m. Up projection: up[seq, intermediate] = hidden2 × W_up^T
-        gemm(buf_.up, buf_.hidden2, layer.up_proj, seq_len, C::intermediate_size, C::hidden_size);
-
-        // 2n. SiLU(gate) × up → gate  (in-place)
-        launch_silu_mul(buf_.gate, buf_.gate, buf_.up,
-                        seq_len * C::intermediate_size);
-
-        // 2o. Down projection: ffn_out[seq, hidden] = gate[seq, intermediate] × W_down^T
+        // 2m. Down projection: ffn_out[seq, hidden] = gate[seq, intermediate] × W_down^T
         gemm(buf_.ffn_out, buf_.gate, layer.down_proj, seq_len, C::hidden_size, C::intermediate_size);
 
-        // 2p. Residual: hidden += ffn_out
+        // 2n. Residual: hidden += ffn_out
         launch_residual_add(buf_.hidden, buf_.hidden, buf_.ffn_out,
                             seq_len * C::hidden_size);
     }

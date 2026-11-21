@@ -16,8 +16,8 @@
 //    q:          [max_seq, q_dim]           — Q split out of qkv (K/V go
 //                                             straight into the KV cache)
 //    attn_out:   [max_seq, q_dim]           — attention output
-//    gate:       [max_seq, intermediate]    — FFN gate output
-//    up:         [max_seq, intermediate]    — FFN up output
+//    gate:       [max_seq, intermediate]    — FFN activation silu(gate)·up
+//    gate_up:    [max_seq, 2·intermediate]  — fused gate|up GEMM output (prefill only)
 //    ffn_out:    [max_seq, hidden_size]     — FFN down output
 //    logits:     [vocab_size]               — FP32 logits, last token
 //
@@ -33,8 +33,8 @@ struct InferenceBuffers {
     half* q;            // [max_seq, q_dim]
     half* qkv;          // [max_seq, qkv_dim] — fused Q|K|V projection output
     half* attn_out;     // [max_seq, q_dim]
-    half* gate;         // [max_seq, intermediate_size]
-    half* up;           // [max_seq, intermediate_size]
+    half* gate;         // [max_seq, intermediate_size] — silu(gate)·up, input to down_proj
+    half* gate_up;      // [max_seq, 2*intermediate_size], interleaved gate/up groups
     half* ffn_out;      // [max_seq, hidden_size]
     half* logits_half;  // [vocab_size] — LM head GEMM output
     float* logits;      // [vocab_size] — FP32, last token only

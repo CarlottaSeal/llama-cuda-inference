@@ -288,6 +288,32 @@ constexpr int GEMV_MAX_PARTIAL_BLOCKS = 1024;    // cap on split * col_blocks wh
 __device__ float    g_gemv_ws[GEMV_MAX_PARTIAL_BLOCKS * GEMV_COLS];
 __device__ unsigned g_gemv_count[GEMV_MAX_PARTIAL_BLOCKS];
 
+static_assert(GEMV_COLS == 2 * GATE_UP_GROUP, "a GEMV block must hold one gate group and its up group");
+
+// Write the block's 64 finished column sums (held by threads 0..63). Must be
+// reached by the whole block. SWIGLU: columns 0..31 are gate, 32..63 the
+// matching up; write silu(g) * u for 32 outputs. g and u are rounded to FP16
+// first and the math matches silu_mul_kernel, so the result is the same as
+// two plain GEMVs followed by launch_silu_mul given the same sums.
+template <bool SWIGLU>
+__device__ __forceinline__ void gemv_store(half* __restrict__ y, int n0, int N, float v) {
+    const int tid = threadIdx.x;
+    if constexpr (!SWIGLU) {
+        if (tid < GEMV_COLS && n0 + tid < N) y[n0 + tid] = __float2half(v);
+    } else {
+        __shared__ float fin[GEMV_COLS];
+        if (tid < GEMV_COLS) fin[tid] = __half2float(__float2half(v));
+        __syncthreads();
+        if (tid < GATE_UP_GROUP) {
+            float g = fin[tid], u = fin[GATE_UP_GROUP + tid];
+            float sigmoid_g = 1.0f / (1.0f + expf(-g));
+            float silu_g = g * sigmoid_g;
+            y[blockIdx.x * GATE_UP_GROUP + tid] = __float2half(silu_g * u);
+        }
+    }
+}
+
+template <bool SWIGLU>
 __global__ void __launch_bounds__(GEMV_THREADS)
 gemv_kernel(half* __restrict__ y, const half* __restrict__ x,
             const half* __restrict__ W, int N, int K, int chunk) {
@@ -330,7 +356,7 @@ gemv_kernel(half* __restrict__ y, const half* __restrict__ x,
 
     const int n = n0 + tid;
     if (gridDim.y == 1) {
-        if (tid < GEMV_COLS && n < N) y[n] = __float2half(sum);
+        gemv_store<SWIGLU>(y, n0, N, sum);
         return;
     }
 
@@ -348,18 +374,19 @@ gemv_kernel(half* __restrict__ y, const half* __restrict__ x,
     __syncthreads();
     if (!is_last) return;
 
+    float total = 0.0f;
     if (tid < GEMV_COLS && n < N) {
-        float total = 0.0f;
         for (int s = 0; s < (int)gridDim.y; s++)
             total += __ldcg(&g_gemv_ws[s * cols_in_grid + n]);  // bypass L1: other SMs wrote these
-        y[n] = __float2half(total);
     }
     if (tid == 0) g_gemv_count[blockIdx.x] = 0;  // ready for the next launch
+    gemv_store<SWIGLU>(y, n0, N, total);
 }
 
 bool gemv_supported(int N) { return N % 8 == 0; }
 
-void launch_gemv(half* y, const half* x, const half* W, int N, int K) {
+template <bool SWIGLU>
+static void launch_gemv_impl(half* y, const half* x, const half* W, int N, int K) {
     static int target_blocks = 0;
     if (!target_blocks) {
         int dev = 0, sms = 0;
@@ -379,5 +406,14 @@ void launch_gemv(half* y, const half* x, const half* W, int N, int K) {
     int chunk = cdiv(cdiv(K, split), GEMV_ROWS) * GEMV_ROWS;
     split = cdiv(K, chunk);
     dim3 grid(col_blocks, split);
-    gemv_kernel<<<grid, GEMV_THREADS>>>(y, x, W, N, K, chunk);
+    gemv_kernel<SWIGLU><<<grid, GEMV_THREADS>>>(y, x, W, N, K, chunk);
+}
+
+void launch_gemv(half* y, const half* x, const half* W, int N, int K) {
+    launch_gemv_impl<false>(y, x, W, N, K);
+}
+
+void launch_gemv_swiglu(half* out, const half* x, const half* W_gate_up, int I, int K) {
+    // 2*I columns, a multiple of 64: every block is a full gate group + up group
+    launch_gemv_impl<true>(out, x, W_gate_up, 2 * I, K);
 }

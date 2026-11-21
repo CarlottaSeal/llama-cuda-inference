@@ -35,6 +35,15 @@ void launch_gemm_wmma(half* C, const half* A, const half* B, int M, int N, int K
 bool gemv_supported(int N);
 void launch_gemv(half* y, const half* x, const half* W, int N, int K);
 
+// Fused gate/up: W_gate_up is [K, 2*I] with gate and up columns interleaved in
+// groups of GATE_UP_GROUP: g[0:32] u[0:32] g[32:64] u[32:64] ... One GEMV block
+// (64 columns) then holds matching gate and up outputs.
+constexpr int GATE_UP_GROUP = 32;
+// Decode: out[I] = silu(x·W_gate) * (x·W_up) in one launch. Needs I % GATE_UP_GROUP == 0.
+void launch_gemv_swiglu(half* out, const half* x, const half* W_gate_up, int I, int K);
+// Prefill: out[rows, I] = silu(gate) * up, read from the interleaved [rows, 2*I] GEMM output.
+void launch_silu_mul_interleaved(half* out, const half* gate_up, int rows, int I);
+
 // --- M5: Attention ---
 void launch_attention_naive(half* out, const half* Q, const half* K, const half* V, int seq_len, int kv_len, int num_q_heads, int num_kv_heads, int head_dim, float scale);
 void launch_flash_attention_gqa(half* out, const half* Q, const half* K, const half* V, int seq_len, int kv_len, int num_q_heads, int num_kv_heads, int head_dim, float scale);

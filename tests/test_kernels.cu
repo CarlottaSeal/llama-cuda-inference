@@ -982,6 +982,108 @@ bool test_gemv() {
     return true;
 }
 
+// Interleave two [K, I] matrices into [K, 2I]: a[0:G] b[0:G] a[G:2G] b[G:2G] ...
+static std::vector<half> interleave_gate_up(const std::vector<half>& a, const std::vector<half>& b,
+                                            int K, int I) {
+    const int G = GATE_UP_GROUP;
+    std::vector<half> out((size_t)K * 2 * I);
+    for (int k = 0; k < K; k++)
+        for (int c = 0; c < I; c++) {
+            out[(size_t)k * 2 * I + (c / G) * 2 * G + c % G]     = a[(size_t)k * I + c];
+            out[(size_t)k * 2 * I + (c / G) * 2 * G + c % G + G] = b[(size_t)k * I + c];
+        }
+    return out;
+}
+
+bool test_gate_up_fused() {
+    printf("Testing fused gate/up + SwiGLU... ");
+
+    // {I, K, M}: the Llama MLP shape (decode M=1, and a prefill M), a small
+    // shape whose K gets split, and a single group (no split, one block).
+    const int shapes[][3] = { {8192, 2048, 7}, {96, 1000, 20}, {32, 37, 3} };
+
+    for (const auto& s : shapes) {
+        const int I = s[0], K = s[1], M = s[2];
+        std::vector<float> h_x((size_t)M * K), h_g((size_t)K * I), h_u((size_t)K * I);
+        for (size_t i = 0; i < h_x.size(); i++) h_x[i] = ((int)((i * 7 + 3) % 200) - 100) * 0.005f;
+        for (size_t i = 0; i < h_g.size(); i++) h_g[i] = ((int)((i * 11 + 5) % 200) - 100) * 0.003f;
+        for (size_t i = 0; i < h_u.size(); i++) h_u[i] = ((int)((i * 13 + 1) % 200) - 100) * 0.003f;
+        auto xh = to_half(h_x), gh = to_half(h_g), uh = to_half(h_u);
+        auto guh = interleave_gate_up(gh, uh, K, I);
+
+        half *d_x, *d_g, *d_u, *d_gu, *d_out, *d_ref, *d_tg, *d_tu, *d_tgu;
+        size_t w_bytes = (size_t)K * I * sizeof(half);
+        CUDA_CHECK(cudaMalloc(&d_x, xh.size() * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_g, w_bytes));
+        CUDA_CHECK(cudaMalloc(&d_u, w_bytes));
+        CUDA_CHECK(cudaMalloc(&d_gu, 2 * w_bytes));
+        CUDA_CHECK(cudaMalloc(&d_out, (size_t)M * I * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_ref, (size_t)M * I * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_tg, (size_t)M * I * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_tu, (size_t)M * I * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_tgu, (size_t)M * 2 * I * sizeof(half)));
+        CUDA_CHECK(cudaMemcpy(d_x, xh.data(), xh.size() * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_g, gh.data(), w_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_u, uh.data(), w_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_gu, guh.data(), 2 * w_bytes, cudaMemcpyHostToDevice));
+
+        // --- Decode (row 0): fused GEMV vs a double-precision reference, run twice ---
+        std::vector<half> y1(I), y2(I);
+        for (int rep = 0; rep < 2; rep++) {
+            CUDA_CHECK(cudaMemset(d_out, 0xff, I * sizeof(half)));  // NaN fill
+            launch_gemv_swiglu(d_out, d_x, d_gu, I, K);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(rep ? y2.data() : y1.data(), d_out, I * sizeof(half), cudaMemcpyDeviceToHost));
+        }
+        bool ok = true;
+        for (int c = 0; c < I && ok; c++) {
+            double g = 0.0, u = 0.0;
+            for (int k = 0; k < K; k++) {
+                double xv = __half2float(xh[k]);
+                g += xv * __half2float(gh[(size_t)k * I + c]);
+                u += xv * __half2float(uh[(size_t)k * I + c]);
+            }
+            float ref = (float)(g / (1.0 + exp(-g)) * u);
+            float got = __half2float(y1[c]);
+            float tol = fmaxf(1e-2f, fabsf(ref) * 5e-3f);  // g, u and the result each rounded to FP16
+            if (!(fabsf(got - ref) <= tol)) {
+                fprintf(stderr, "  decode I=%d K=%d mismatch at %d: got %f, expected %f\n", I, K, c, got, ref);
+                ok = false;
+            }
+            if (ok && memcmp(&y1[c], &y2[c], sizeof(half)) != 0) {
+                fprintf(stderr, "  decode I=%d K=%d not deterministic at %d\n", I, K, c);
+                ok = false;
+            }
+        }
+
+        // --- Prefill: one wmma GEMM + interleaved SwiGLU must equal the unfused path bit for bit
+        //     (each wmma output tile is computed the same way whatever N is) ---
+        launch_gemm_wmma(d_tg, d_x, d_g, M, I, K);
+        launch_gemm_wmma(d_tu, d_x, d_u, M, I, K);
+        launch_silu_mul(d_ref, d_tg, d_tu, M * I);
+        launch_gemm_wmma(d_tgu, d_x, d_gu, M, 2 * I, K);
+        launch_silu_mul_interleaved(d_out, d_tgu, M, I);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<half> p_ref((size_t)M * I), p_got((size_t)M * I);
+        CUDA_CHECK(cudaMemcpy(p_ref.data(), d_ref, p_ref.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(p_got.data(), d_out, p_got.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < p_ref.size() && ok; i++) {
+            if (memcmp(&p_ref[i], &p_got[i], sizeof(half)) != 0) {
+                fprintf(stderr, "  prefill I=%d K=%d M=%d differs at row %zu col %zu: %f vs %f\n", I, K, M,
+                        i / I, i % I, __half2float(p_got[i]), __half2float(p_ref[i]));
+                ok = false;
+            }
+        }
+
+        cudaFree(d_x); cudaFree(d_g); cudaFree(d_u); cudaFree(d_gu); cudaFree(d_out);
+        cudaFree(d_ref); cudaFree(d_tg); cudaFree(d_tu); cudaFree(d_tgu);
+        TEST_ASSERT(ok, "fused gate/up mismatch");
+    }
+
+    printf("PASSED\n");
+    return true;
+}
+
 // ============================================================
 //  M5 Tests: Attention
 // ============================================================
@@ -1364,6 +1466,7 @@ int main() {
     run(test_gemm_realistic, "GEMM Realistic");
     run(test_gemm_wmma_edges, "GEMM wmma edges");
     run(test_gemv,            "Decode GEMV");
+    run(test_gate_up_fused,   "Fused gate/up + SwiGLU");
 
     // M5: Attention
     run(test_attention_naive, "Attention Naive");
