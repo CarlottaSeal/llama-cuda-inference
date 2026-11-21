@@ -350,7 +350,9 @@ __device__ unsigned g_fd_count[FD_MAX_KV_HEADS];
 __global__ void __launch_bounds__(32)
 flash_decode_kernel(half* __restrict__ O, const half* __restrict__ Q,
                     const half* __restrict__ K, const half* __restrict__ V,
-                    int kv_len, int num_kv_heads, int chunk, float scale) {
+                    int kv_len, int num_kv_heads, int chunk, float scale,
+                    const int* __restrict__ d_pos) {
+    if (d_pos) kv_len = *d_pos + 1;   // graph replay: position read on the device
     const int kvh = blockIdx.x, split = blockIdx.y, nsplit = gridDim.y;
     const int lane = threadIdx.x;
     const int kv_stride = num_kv_heads * FD_D;
@@ -703,7 +705,18 @@ void launch_flash_decode(half* out, const half* Q, const half* K, const half* V,
     // One 32-position tile per block until the split cap; longer contexts get longer chunks
     int chunk = max(FD_TILE, cdiv(cdiv(kv_len, FD_MAX_SPLITS), FD_TILE) * FD_TILE);
     dim3 grid(num_kv_heads, cdiv(kv_len, chunk));
-    flash_decode_kernel<<<grid, 32>>>(out, Q, K, V, kv_len, num_kv_heads, chunk, scale);
+    flash_decode_kernel<<<grid, 32>>>(out, Q, K, V, kv_len, num_kv_heads, chunk, scale, nullptr);
+}
+
+void launch_flash_decode_dev(half* out, const half* Q, const half* K, const half* V,
+                             const int* d_pos, int max_kv_len, int num_q_heads, int num_kv_heads,
+                             int head_dim, float scale) {
+    (void)num_q_heads; (void)head_dim;
+    // Chunking as for the longest context this launch can see. A split past kv_len has
+    // an empty range: it publishes m = -FLT_MAX, l = 0, O = 0, which the merge weights by 0.
+    int chunk = max(FD_TILE, cdiv(cdiv(max_kv_len, FD_MAX_SPLITS), FD_TILE) * FD_TILE);
+    dim3 grid(num_kv_heads, cdiv(max_kv_len, chunk));
+    flash_decode_kernel<<<grid, 32>>>(out, Q, K, V, max_kv_len, num_kv_heads, chunk, scale, d_pos);
 }
 
 void launch_flash_attention_gqa(

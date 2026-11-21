@@ -53,7 +53,9 @@ __global__ void rope_kernel(
     int   head_dim,
     int   start_pos,
     float theta,
-    RopeScaling scaling
+    RopeScaling scaling,
+    const int* d_start_pos,
+    bool rows_at_pos   // x is indexed by absolute position (KV cache base) instead of token
 ) {
     int token = blockIdx.x;   // which token in the sequence
     int head  = blockIdx.y;   // which head
@@ -62,7 +64,8 @@ __global__ void rope_kernel(
     if (token >= seq_len || head >= num_heads || pair >= head_dim / 2) return;
 
     // Position in the full sequence (accounting for KV cache offset)
-    int pos = start_pos + token;
+    int pos = (d_start_pos ? *d_start_pos : start_pos) + token;
+    int row = rows_at_pos ? pos : token;
 
     // Compute rotation angle
     // freq = 1 / theta^(2*pair / head_dim)
@@ -73,7 +76,7 @@ __global__ void rope_kernel(
     float sin_a = sinf(angle);
 
     // The pair: x[token, head, pair] and x[token, head, pair + head_dim/2]
-    long long offset = (long long)token * num_heads * head_dim
+    long long offset = (long long)row * num_heads * head_dim
                      + (long long)head * head_dim
                      + pair;
     int half_dim = head_dim / 2;
@@ -97,15 +100,19 @@ void launch_rope(
     int head_dim,
     int start_pos,
     float theta,
-    RopeScaling scaling
+    RopeScaling scaling,
+    const int* d_start_pos
 ) {
     int half_dim = head_dim / 2;  // threads per block = 32 for head_dim=64
 
     // Apply RoPE to Q
     dim3 grid_q(seq_len, num_q_heads);
-    rope_kernel<<<grid_q, half_dim>>>(q, seq_len, num_q_heads, head_dim, start_pos, theta, scaling);
+    rope_kernel<<<grid_q, half_dim>>>(q, seq_len, num_q_heads, head_dim, start_pos, theta, scaling,
+                                      d_start_pos, false);
 
-    // Apply RoPE to K
+    // Apply RoPE to K. With a device position, k is the cache base and the rows
+    // are found at that position on the device.
     dim3 grid_k(seq_len, num_kv_heads);
-    rope_kernel<<<grid_k, half_dim>>>(k, seq_len, num_kv_heads, head_dim, start_pos, theta, scaling);
+    rope_kernel<<<grid_k, half_dim>>>(k, seq_len, num_kv_heads, head_dim, start_pos, theta, scaling,
+                                      d_start_pos, d_start_pos != nullptr);
 }

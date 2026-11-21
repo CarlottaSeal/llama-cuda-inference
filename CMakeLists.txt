@@ -13,6 +13,10 @@ set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH})
 
 # ---- Compiler flags ----
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math")
+# Kernel launches without an explicit stream go to the per-thread default
+# stream, which (unlike the legacy NULL stream) can be captured into a CUDA
+# Graph. The decode step is captured once and replayed per token.
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --default-stream per-thread")
 
 # ---- Include paths ----
 include_directories(${PROJECT_SOURCE_DIR}/include)

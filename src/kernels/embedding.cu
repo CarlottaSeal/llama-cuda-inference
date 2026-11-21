@@ -19,12 +19,13 @@ __global__ void embedding_kernel(
     const half* table,
     const int* token_ids,
     int seq_len,
-    int hidden_size
+    int hidden_size,
+    const int* d_offset
 ) {
     int tok = blockIdx.x;  // which token in the sequence
     if (tok >= seq_len) return;
 
-    int id = token_ids[tok];
+    int id = token_ids[(d_offset ? *d_offset : 0) + tok];
     const half* src = table + (long long)id * hidden_size;
     half* dst = out + (long long)tok * hidden_size;
 
@@ -35,7 +36,7 @@ __global__ void embedding_kernel(
 }
 
 void launch_embedding(half* out, const half* table, const int* token_ids,
-                       int seq_len, int hidden_size) {
+                       int seq_len, int hidden_size, const int* d_offset) {
     constexpr int BLOCK = 256;
-    embedding_kernel<<<seq_len, BLOCK>>>(out, table, token_ids, seq_len, hidden_size);
+    embedding_kernel<<<seq_len, BLOCK>>>(out, table, token_ids, seq_len, hidden_size, d_offset);
 }

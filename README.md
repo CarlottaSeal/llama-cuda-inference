@@ -12,10 +12,11 @@ capital and largest city. Paris is the most populous urban area in the European 
 **Status:** runs the official `meta-llama/Llama-3.2-1B` checkpoint end to end. Greedy output
 matches HF `transformers` token for token on the prompts checked (see [Correctness](#correctness)).
 Every kernel is also unit-tested against a CPU reference (17 tests), and the forward pass runs
-clean under `compute-sanitizer`. Decode runs at ~200–237 tok/s at 128 tokens and ~225 tok/s over a
-full 2K context. A split-KV decode attention kernel keeps long contexts from slowing it down. It started at ~14.6:
+clean under `compute-sanitizer`. Decode runs at ~273 tok/s at 128 tokens and ~254 tok/s for 200
+tokens after an 1802-token prompt. A split-KV decode attention kernel keeps long contexts from slowing it down. It started at ~14.6:
 transposing weights at load time brought it to ~51, a dedicated M=1 GEMV to ~200, fusing
-Q/K/V into one projection added ~6%, and fusing gate/up another ~2%. The large decode projections stream weights at 92–95% of
+Q/K/V into one projection added ~6%, fusing gate/up another ~2%, and replaying each decode step
+from a CUDA Graph ~10% (~273 tok/s at 128 tokens). The large decode projections stream weights at 92–95% of
 DRAM bandwidth. Prefill attention runs on Tensor Cores (a port of the author's FlashAttention-lite
 v5), and with gate/up fused a 2K-token prefill takes ~236 ms, down from ~715 ms; see [Performance](#performance).
 
@@ -408,6 +409,49 @@ identical on both [Correctness](#correctness) prompts and the 2002-token prompt.
 pass, and `compute-sanitizer` memcheck and synccheck report 0 errors on a 132-token prefill plus 3
 decode steps.
 
+### CUDA Graph decode
+
+A decode step is 197 kernels. Launched one by one from the host, with a blocking argmax copy back
+before the next step can start, the GPU sat idle for part of every step. The decode step is now
+captured once into a CUDA Graph and replayed for every token:
+
+- **Positions on the device.** `d_pos` holds the position of the token the step consumes. The
+  embedding, the QKV split (KV cache write row), RoPE and decode attention read it when they run,
+  so one captured graph serves every position. Decode attention uses a fixed grid sized for
+  `max_seq`; splits past `*d_pos + 1` publish an empty partial (m = −∞, l = 0). With `max_seq` ≤ 2048
+  the chunking matches the host-kv_len launch, so the output is bit-identical (unit-tested).
+- **Argmax feeds the next step.** The argmax kernel writes the token into `token_ids[pos + 1]` and
+  increments `d_pos`, so no host round trip sits between steps.
+- **Two-deep host pipeline.** The host enqueues step k, then waits (event + pinned 4-byte copy) for
+  step k−1's token, prints it, and checks for EOS. The GPU always has the next step queued. After an
+  EOS one extra step may run; its output is discarded.
+- The build uses `--default-stream per-thread` so the default stream can be captured
+  (`cudaStreamCaptureModeThreadLocal`). Capture takes 5–11 ms at startup. `LLAMA_NO_GRAPH=1`
+  falls back to per-kernel launches, for A/B runs and profiling.
+
+nsys, 128-token run, median over 127 steps (`--cuda-graph-trace=node` for the graph run):
+
+| | Eager | Graph |
+|---|---|---|
+| kernels / step | 197 | 197 |
+| kernel time / step | 3410.5 µs | 3410.5 µs |
+| step span (argmax to argmax) | 3960.5 µs | **3578.4 µs** |
+| idle / step | 550 µs (13.9%) | 168 µs (4.7%) |
+
+End to end, interleaved with `7b464af`, 3 s idle before every run. Of the 5 32-token runs the first
+3 had 68–87% GPU utilization from another process before the run and are left out:
+
+| | Before | After |
+|---|---|---|
+| decode, 32 tokens (runs 4–5) | 246.9–247.9 tok/s | 274.7 tok/s |
+| decode, 128 tokens (5 runs) | 248.6–249.4 tok/s | **273.2–274.5 tok/s** (+10%) |
+| decode, 200 tokens after a 1802-token prompt (3 runs) | 231.0–232.1 tok/s | **253.4–253.9 tok/s** (+9%) |
+
+Generated text is identical to `7b464af` on both [Correctness](#correctness) prompts and the
+2002-token prompt, and identical between graph and `LLAMA_NO_GRAPH=1` in the same build on 200
+tokens (6-token prompt) and on the 2002-token prompt, which runs into `max_seq` = 2048. 17/17 unit
+tests pass, and `compute-sanitizer` memcheck reports 0 errors.
+
 ### Context length
 
 The tables above use a 6-token prompt, so attention barely shows up. With the generic flash
@@ -505,10 +549,11 @@ Done:
 - **Split-KV decode attention** (see [Split-KV Decode Attention](#split-kv-decode-attention)): decode attention at kv_len 2032 goes from 465 to 24.5 µs per layer, and 2K-context decode from ~125 to ~225 tok/s.
 - **Tensor Core prefill attention** (see [Tensor Core Prefill Attention](#tensor-core-prefill-attention)): FlashAttention-lite v5 ported with causal tile skip, GQA, query offset and strided KV. Prefill attention at 2002 tokens goes from 448 to 3.9 ms, and the 2K-token prefill from ~715 to ~275 ms.
 - **Fused gate/up projection** (see [Fused gate/up projection](#fused-gategup-projection)): W_gate and W_up interleaved in 32-column groups; decode runs one GEMV with SwiGLU in its epilogue, prefill one wmma GEMM. +2.4% decode at 128 tokens, −12.6% prefill at 2002 tokens.
+- **CUDA Graph decode** (see [CUDA Graph decode](#cuda-graph-decode)): one captured step replayed per token, positions read on the device, argmax writes the next input token, host one step behind. Idle per step 550 → 168 µs; +10% decode at 128 tokens.
 
 Not implemented yet, in the order the measurements suggest:
 
-1. **Launch overhead / host sync in decode** — ~197 kernel launches per token (nsys average per forward) plus a device→host argmax copy. GPU kernel time is still well below wall time per step, so CUDA Graphs (or a persistent kernel) is the next step.
+1. **Decode kernel time** — with graphs, a step is 95% kernel time (3.41 ms). Argmax is one ~70 µs single-block launch per token; a multi-block argmax would cut most of that. The remaining ~168 µs idle per step comes from gaps between the 197 graph nodes; fewer, larger kernels (e.g. fusing RMSNorm and residual adds into neighbouring kernels) would shrink both.
 
 2. **GEMM (prefill): shared tile reuse + double buffering** — ~95% of a 2K-token prefill's GPU time. With gate/up fused, the same work in one launch twice as wide took 24% less time, which isn't explained yet; ncu on this kernel is the first step. Each warp in the wmma kernel loads its own A and B fragments, so the 16 warps in a block don't share tiles, and loads and MMAs run back to back. Block-level shared-memory tiles with double buffering would cut global traffic and hide load latency.
 

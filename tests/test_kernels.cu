@@ -1360,6 +1360,28 @@ bool test_flash_decode() {
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaMemcpy(rep ? o2.data() : o1.data(), d_O, q_n * sizeof(half), cudaMemcpyDeviceToHost));
         }
+
+        // Graph-replay variant (kv_len = *d_pos + 1 on the device, grid sized for a
+        // longer max): bit-identical whenever its chunking matches, i.e. max <= 2048 or max == KV
+        int* d_pos;
+        CUDA_CHECK(cudaMalloc(&d_pos, sizeof(int)));
+        int pos = KV - 1;
+        CUDA_CHECK(cudaMemcpy(d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice));
+        for (int max_kv : {KV, 2048}) {
+            if (max_kv < KV || (KV > 2048 && max_kv != KV)) continue;
+            std::vector<half> o3(q_n);
+            CUDA_CHECK(cudaMemset(d_O, 0xff, q_n * sizeof(half)));
+            launch_flash_decode_dev(d_O, d_Q, d_K, d_V, d_pos, max_kv, NQH, NKVH, HD, SCALE);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(o3.data(), d_O, q_n * sizeof(half), cudaMemcpyDeviceToHost));
+            for (size_t i = 0; i < q_n; i++)
+                if (memcmp(&o1[i], &o3[i], sizeof(half)) != 0) {
+                    fprintf(stderr, "  kv=%d max_kv=%d device-position launch differs at %zu: %f vs %f\n",
+                            KV, max_kv, i, __half2float(o3[i]), __half2float(o1[i]));
+                    return false;
+                }
+        }
+        cudaFree(d_pos);
         cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O);
 
         for (size_t i = 0; i < q_n; i++) {

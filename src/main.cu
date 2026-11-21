@@ -17,6 +17,7 @@
 #include "model/tokenizer.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -114,6 +115,16 @@ int main(int argc, char** argv) {
     engine.init(total_len);
     engine.set_use_flash(true);
     engine.set_use_wmma(true);
+    // LLAMA_NO_GRAPH=1 launches every decode kernel individually (for A/B runs and profiling)
+    const char* no_graph = getenv("LLAMA_NO_GRAPH");
+    engine.set_use_graph(!(no_graph && no_graph[0] == '1'));
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        bool graph = engine.prepare_decode_graph(weights);
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+        if (graph) printf("Decode graph captured: %.1f ms\n", ms);
+        else       printf("Decode graph: off\n");
+    }
     printf("\n");
 
     // ---- Step 5: Prefill ----
@@ -135,28 +146,24 @@ int main(int argc, char** argv) {
     std::vector<int> generated;
     auto t_decode_start = std::chrono::high_resolution_clock::now();
 
-    for (int step = 0; step < max_new_tokens; step++) {
-        // Sample next token from logits
-        int next_token = engine.sample_greedy(1);
-
-        // Check for EOS
-        if (next_token == tokenizer.eos_id()) {
+    // Print a token; false (stop) on EOS
+    auto emit = [&](int token) {
+        if (token == tokenizer.eos_id()) {
             printf(" [EOS]");
-            break;
+            return false;
         }
-
-        generated.push_back(next_token);
-
-        // Print the decoded token
-        std::string token_str = tokenizer.decode_token(next_token);
+        generated.push_back(token);
+        std::string token_str = tokenizer.decode_token(token);
         printf("%s", token_str.c_str());
         fflush(stdout);
+        return true;
+    };
 
-        // Feed token back for next step
-        engine.set_tokens(&next_token, 1, prompt_len + step);
-        engine.forward(weights, /*seq_len=*/1, /*start_pos=*/prompt_len + step);
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
+    // The first token comes from the prefill logits; each decode forward then
+    // produces the next one (max_new_tokens forwards in total, as before)
+    if (max_new_tokens > 0 && emit(engine.sample_greedy(1)))
+        engine.decode_greedy(weights, generated.back(), prompt_len, max_new_tokens, emit);
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     auto t_decode_end = std::chrono::high_resolution_clock::now();
     double decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();

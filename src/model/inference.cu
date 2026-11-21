@@ -30,7 +30,11 @@
 //  Argmax kernel for greedy sampling
 // ============================================================
 
-__global__ void argmax_kernel(const float* logits, int* result, int n) {
+// With d_pos set (graph decode), the winner is written as the next token,
+// token_ids[*d_pos + 1] (when that is inside the buffer), and *d_pos advances,
+// so the next replay of the decode step consumes it. Otherwise into result[0].
+__global__ void argmax_kernel(const float* logits, int* result, int n,
+                              int* token_ids, int* d_pos, int max_seq) {
     // Single block, find argmax
     extern __shared__ char smem[];
     float* s_max = (float*)smem;
@@ -63,7 +67,13 @@ __global__ void argmax_kernel(const float* logits, int* result, int n) {
     }
 
     if (tid == 0) {
-        result[0] = s_idx[0];
+        if (d_pos) {
+            int p = *d_pos;
+            if (p + 1 < max_seq) token_ids[p + 1] = s_idx[0];
+            *d_pos = p + 1;
+        } else {
+            result[0] = s_idx[0];
+        }
     }
 }
 
@@ -93,12 +103,18 @@ static void launch_half_to_float(float* out, const half* in, int n) {
 //  two cache cudaMemcpys the separate-projection path needed.
 // ============================================================
 
+// d_pos (optional): k_dst/v_dst are the cache bases; rows go to the device position.
 __global__ void qkv_split_kernel(half* q, half* k_dst, half* v_dst,
-                                 const half* qkv, int seq_len) {
+                                 const half* qkv, int seq_len, const int* d_pos) {
     using C = LlamaConfig;
     int i = blockIdx.x * blockDim.x + threadIdx.x;  // index in half2 units
     constexpr int row2 = C::qkv_dim / 2;
     if (i >= seq_len * row2) return;
+    if (d_pos) {
+        size_t off = (size_t)*d_pos * C::kv_dim;
+        k_dst += off;
+        v_dst += off;
+    }
     int r = i / row2, c = (i % row2) * 2;
     half2 val = reinterpret_cast<const half2*>(qkv)[i];
     half* dst;
@@ -108,9 +124,10 @@ __global__ void qkv_split_kernel(half* q, half* k_dst, half* v_dst,
     *reinterpret_cast<half2*>(dst) = val;
 }
 
-static void launch_qkv_split(half* q, half* k_dst, half* v_dst, const half* qkv, int seq_len) {
+static void launch_qkv_split(half* q, half* k_dst, half* v_dst, const half* qkv, int seq_len,
+                             const int* d_pos = nullptr) {
     int n2 = seq_len * LlamaConfig::qkv_dim / 2;
-    qkv_split_kernel<<<cdiv(n2, 256), 256>>>(q, k_dst, v_dst, qkv, seq_len);
+    qkv_split_kernel<<<cdiv(n2, 256), 256>>>(q, k_dst, v_dst, qkv, seq_len, d_pos);
 }
 
 // ============================================================
@@ -156,8 +173,10 @@ bool LlamaInference::init(int max_seq_len) {
     alloc(&buf_.logits_half, (size_t)C::vocab_size, "logits_half");
     alloc_f(&buf_.logits, (size_t)C::vocab_size, "logits");
 
-    // Token IDs
+    // Token IDs, and the decode position / argmax slots
     alloc_i(&buf_.token_ids, max_seq_, "token_ids");
+    alloc_i(&buf_.d_pos, 1, "d_pos");
+    alloc_i(&buf_.d_argmax, 1, "d_argmax");
 
     // KV Cache: per-layer K and V tensors
     for (int l = 0; l < C::num_layers; l++) {
@@ -187,6 +206,13 @@ void LlamaInference::cleanup() {
     free_ptr(buf_.logits_half);
     free_ptr(buf_.logits);
     free_ptr(buf_.token_ids);
+    free_ptr(buf_.d_pos);
+    free_ptr(buf_.d_argmax);
+
+    if (graph_exec_) { cudaGraphExecDestroy((cudaGraphExec_t)graph_exec_); graph_exec_ = nullptr; }
+    graph_weights_ = nullptr;
+    for (auto& e : events_) if (e) { cudaEventDestroy((cudaEvent_t)e); e = nullptr; }
+    if (h_tokens_) { cudaFreeHost(h_tokens_); h_tokens_ = nullptr; }
 
     for (int l = 0; l < LlamaConfig::num_layers; l++) {
         free_ptr(buf_.kv_cache_k[l]);
@@ -229,14 +255,21 @@ void LlamaInference::gemm(half* C, const half* A, const half* B, int M, int N, i
 // ============================================================
 
 void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start_pos) {
+    forward_impl(weights, seq_len, start_pos, nullptr);
+    kv_len_ = start_pos + seq_len;
+}
+
+void LlamaInference::forward_impl(const LlamaWeights& weights, int seq_len, int start_pos,
+                                  const int* d_pos) {
     using C = LlamaConfig;
 
-    int kv_len = start_pos + seq_len;  // total KV length after this pass
+    int kv_len = start_pos + seq_len;  // total KV length after this pass (host mode)
 
     // ---- Step 1: Embedding lookup ----
     // hidden[seq_len, hidden_size] = embedding_table[token_ids[start_pos:]]
     launch_embedding(buf_.hidden, weights.embedding,
-                     buf_.token_ids + start_pos, seq_len, C::hidden_size);
+                     d_pos ? buf_.token_ids : buf_.token_ids + start_pos, seq_len, C::hidden_size,
+                     d_pos);
 
     // ---- Step 2: Transformer layers ----
     for (int l = 0; l < C::num_layers; l++) {
@@ -252,21 +285,30 @@ void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start
         gemm(buf_.qkv, buf_.hidden2, layer.qkv_proj, seq_len, C::qkv_dim, C::hidden_size);
 
         // 2c. Split: Q → q buffer, K/V → KV cache rows [start_pos .. start_pos+seq_len)
-        half* k_new = buf_.kv_cache_k[l] + (size_t)start_pos * C::kv_dim;
-        half* v_new = buf_.kv_cache_v[l] + (size_t)start_pos * C::kv_dim;
-        launch_qkv_split(buf_.q, k_new, v_new, buf_.qkv, seq_len);
+        //     (with d_pos the cache bases are passed and the row is found on the device)
+        const size_t row0 = d_pos ? 0 : (size_t)start_pos * C::kv_dim;
+        half* k_new = buf_.kv_cache_k[l] + row0;
+        half* v_new = buf_.kv_cache_v[l] + row0;
+        launch_qkv_split(buf_.q, k_new, v_new, buf_.qkv, seq_len, d_pos);
 
         // 2d. RoPE on Q and on the new K rows (in place, K inside the cache)
         launch_rope(buf_.q, k_new, seq_len,
                     C::num_q_heads, C::num_kv_heads, C::head_dim,
                     start_pos, C::rope_theta,
                     RopeScaling{C::rope_factor, C::rope_low_freq_factor,
-                                C::rope_high_freq_factor, C::rope_original_max_pos});
+                                C::rope_high_freq_factor, C::rope_original_max_pos},
+                    d_pos);
 
         // 2h. Attention: Q against full KV cache [0..kv_len)
         float scale = 1.0f / sqrtf((float)C::head_dim);
 
-        if (use_flash_ && seq_len == 1 &&
+        if (d_pos) {
+            // graph_decode_ready() checked flash_decode_supported
+            launch_flash_decode_dev(
+                buf_.attn_out, buf_.q,
+                buf_.kv_cache_k[l], buf_.kv_cache_v[l],
+                d_pos, max_seq_, C::num_q_heads, C::num_kv_heads, C::head_dim, scale);
+        } else if (use_flash_ && seq_len == 1 &&
             flash_decode_supported(C::num_q_heads, C::num_kv_heads, C::head_dim)) {
             launch_flash_decode(
                 buf_.attn_out, buf_.q,
@@ -339,28 +381,91 @@ void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start
 
     // Convert to float for sampling
     launch_half_to_float(buf_.logits, buf_.logits_half, C::vocab_size);
-
-    // Update KV length
-    kv_len_ = kv_len;
 }
 
 // ============================================================
 //  Greedy sampling: argmax over logits
 // ============================================================
 
-int LlamaInference::sample_greedy(int seq_len) {
-    int* d_result;
-    CUDA_CHECK(cudaMalloc(&d_result, sizeof(int)));
-
+static void launch_argmax(const float* logits, int* result, int* token_ids, int* d_pos, int max_seq) {
     int block = 256;
     size_t smem = block * (sizeof(float) + sizeof(int));
-    argmax_kernel<<<1, block, smem>>>(buf_.logits, d_result, LlamaConfig::vocab_size);
+    argmax_kernel<<<1, block, smem>>>(logits, result, LlamaConfig::vocab_size, token_ids, d_pos, max_seq);
+}
 
+int LlamaInference::sample_greedy(int seq_len) {
+    (void)seq_len;
+    launch_argmax(buf_.logits, buf_.d_argmax, nullptr, nullptr, 0);
     int result;
-    CUDA_CHECK(cudaMemcpy(&result, d_result, sizeof(int), cudaMemcpyDeviceToHost));
-    cudaFree(d_result);
-
+    CUDA_CHECK(cudaMemcpy(&result, buf_.d_argmax, sizeof(int), cudaMemcpyDeviceToHost));
     return result;
+}
+
+// ============================================================
+//  Graph decode
+//
+//  One decode step — the single-token forward plus the argmax that
+//  writes the next token and advances d_pos — is captured once into
+//  a CUDA Graph and replayed per token: 1 launch instead of ~197.
+//  Nothing in the captured step depends on host values that change
+//  between tokens; position-dependent work reads d_pos.
+// ============================================================
+
+bool LlamaInference::graph_decode_ready(const LlamaWeights& weights) {
+    using C = LlamaConfig;
+    if (graph_exec_ && graph_weights_ == &weights) return true;
+    if (!use_flash_ || !flash_decode_supported(C::num_q_heads, C::num_kv_heads, C::head_dim) ||
+        !gemv_supported(C::qkv_dim) || !gemv_supported(2 * C::intermediate_size) ||
+        !gemv_supported(C::hidden_size) || !gemv_supported(C::vocab_size))
+        return false;
+    if (graph_exec_) { cudaGraphExecDestroy((cudaGraphExec_t)graph_exec_); graph_exec_ = nullptr; }
+
+    cudaStream_t s = cudaStreamPerThread;
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    cudaGraph_t graph;
+    CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+    forward_impl(weights, 1, 0, buf_.d_pos);
+    launch_argmax(buf_.logits, nullptr, buf_.token_ids, buf_.d_pos, max_seq_);
+    CUDA_CHECK(cudaStreamEndCapture(s, &graph));
+    cudaGraphExec_t exec;
+    CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    graph_exec_ = exec;
+    graph_weights_ = &weights;
+
+    if (!h_tokens_) CUDA_CHECK(cudaMallocHost(&h_tokens_, 2 * sizeof(int)));
+    for (auto& e : events_)
+        if (!e) { cudaEvent_t ev; CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming)); e = ev; }
+    return true;
+}
+
+void LlamaInference::graph_decode_start(int first_token, int pos) {
+    cudaStream_t s = cudaStreamPerThread;
+    CUDA_CHECK(cudaMemcpyAsync(buf_.token_ids + pos, &first_token, sizeof(int), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(buf_.d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice, s));
+    // first_token and pos are host stack values: wait until both copies have read them
+    CUDA_CHECK(cudaStreamSynchronize(s));
+}
+
+void LlamaInference::graph_decode_launch(int k, int pos, bool copy_out) {
+    cudaStream_t s = cudaStreamPerThread;
+    CUDA_CHECK(cudaGraphLaunch((cudaGraphExec_t)graph_exec_, s));
+    if (copy_out) {
+        // Step k wrote the token at pos + k + 1; copy it before step k + 1 can run
+        CUDA_CHECK(cudaMemcpyAsync(&h_tokens_[k & 1], buf_.token_ids + pos + k + 1, sizeof(int),
+                                   cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaEventRecord((cudaEvent_t)events_[k & 1], s));
+    }
+}
+
+int LlamaInference::graph_decode_wait(int k) {
+    CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)events_[k & 1]));
+    return h_tokens_[k & 1];
+}
+
+void LlamaInference::graph_decode_finish(int pos, int steps) {
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    kv_len_ = pos + steps;
 }
 
 // ============================================================

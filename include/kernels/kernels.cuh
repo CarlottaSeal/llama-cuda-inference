@@ -10,7 +10,8 @@
 // --- M1: Element-wise kernels ---
 void launch_residual_add(half* out, const half* a, const half* b, int n);
 void launch_silu_mul(half* out, const half* gate, const half* up, int n);
-void launch_embedding(half* out, const half* table, const int* token_ids, int seq_len, int hidden_size);
+// d_offset (optional, device): token i is read from token_ids[*d_offset + i].
+void launch_embedding(half* out, const half* table, const int* token_ids, int seq_len, int hidden_size, const int* d_offset = nullptr);
 
 // --- M2: Reduction kernels ---
 void launch_rmsnorm(half* out, const half* x, const half* weight, int rows, int cols, float eps);
@@ -25,7 +26,10 @@ struct RopeScaling {
     float high_freq_factor  = 4.0f;
     int   original_max_pos  = 8192;
 };
-void launch_rope(half* q, half* k, int seq_len, int num_q_heads, int num_kv_heads, int head_dim, int start_pos, float theta, RopeScaling scaling = {});
+// d_start_pos (optional, device): overrides start_pos, read when the kernel runs. Then k
+// is the KV cache base ([pos, kv_heads·head_dim]) and the rows rotated are those at the
+// device position; q is still indexed from row 0.
+void launch_rope(half* q, half* k, int seq_len, int num_q_heads, int num_kv_heads, int head_dim, int start_pos, float theta, RopeScaling scaling = {}, const int* d_start_pos = nullptr);
 
 // --- M4: GEMM ---
 void launch_gemm_naive(half* C, const half* A, const half* B, int M, int N, int K);
@@ -53,3 +57,8 @@ void launch_flash_prefill(half* out, const half* Q, const half* K, const half* V
 // Split-KV decode attention (seq_len = 1): head_dim 64, 4 Q heads per KV head, <= 8 KV heads.
 bool flash_decode_supported(int num_q_heads, int num_kv_heads, int head_dim);
 void launch_flash_decode(half* out, const half* Q, const half* K, const half* V, int kv_len, int num_q_heads, int num_kv_heads, int head_dim, float scale);
+// Same, with kv_len = *d_pos + 1 read on the device: the grid is sized for max_kv_len,
+// so one launch configuration serves every position (for CUDA Graph replay). Splits past
+// kv_len contribute nothing; for max_kv_len <= 2048 the result is bit-identical to the
+// host-kv_len launch.
+void launch_flash_decode_dev(half* out, const half* Q, const half* K, const half* V, const int* d_pos, int max_kv_len, int num_q_heads, int num_kv_heads, int head_dim, float scale);
