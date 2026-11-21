@@ -272,6 +272,11 @@ void LlamaInference::forward(const LlamaWeights& weights, int seq_len, int start
                 buf_.attn_out, buf_.q,
                 buf_.kv_cache_k[l], buf_.kv_cache_v[l],
                 kv_len, C::num_q_heads, C::num_kv_heads, C::head_dim, scale);
+        } else if (use_flash_ && flash_prefill_supported(C::num_q_heads, C::num_kv_heads, C::head_dim)) {
+            launch_flash_prefill(
+                buf_.attn_out, buf_.q,
+                buf_.kv_cache_k[l], buf_.kv_cache_v[l],
+                seq_len, kv_len, C::num_q_heads, C::num_kv_heads, C::head_dim, scale);
         } else if (use_flash_) {
             launch_flash_attention_gqa(
                 buf_.attn_out, buf_.q,

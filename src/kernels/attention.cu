@@ -467,6 +467,232 @@ flash_decode_kernel(half* __restrict__ O, const half* __restrict__ Q,
     if (lane == 0) g_fd_count[kvh] = 0;  // ready for the next launch
 }
 
+// ============================================================
+//  5e: Prefill attention on Tensor Cores (seq_len > 1)
+//
+//  Ported from the author's FlashAttention-lite v5 (FA-2 structure
+//  on raw mma.sync): each warp owns 16 query rows of a 64-row block;
+//  S, P and O stay in registers; Q/K/V tiles go through XOR-swizzled
+//  shared memory read with ldmatrix; K/V tiles are double-buffered
+//  with cp.async. Changes for this engine:
+//    - layouts: Q/O are [seq, num_q_heads·D], K/V the KV cache
+//      [kv_len, num_kv_heads·D]; one block per (64 query rows, Q head)
+//    - GQA: the block reads KV head q_head / (num_q_heads/num_kv_heads)
+//    - causal mask with a query offset: row i sits at position
+//      kv_len - seq_len + i and sees columns <= that position
+//    - tile skip: a block stops at its last row's position, so tiles
+//      entirely above the diagonal are never loaded
+//    - FP16 output
+// ============================================================
+
+namespace fa {
+
+__device__ __forceinline__ uint32_t smem_u32(const void* p) {
+    return (uint32_t)__cvta_generic_to_shared(p);
+}
+__device__ __forceinline__ void ldsm_x4(uint32_t* r, const half* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
+}
+__device__ __forceinline__ void ldsm_x4_t(uint32_t* r, const half* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
+}
+// c(16x8 f32) += a(16x16 f16, row) * b(16x8 f16, col)
+__device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint32_t pack_half2(float x, float y) {
+    half2 h = __floats2half2_rn(x, y);
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+// 16 B global -> shared, bypassing registers and L1. src-size 0 writes zeros.
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool in) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+                 :: "r"(smem_u32(dst)), "l"(src), "r"(in ? 16 : 0) : "memory");
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+template <int n>
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(n) : "memory"); }
+
+// Row r of a [rows, D] half tile is D/8 chunks of 16 B; chunk c is stored at c ^ (r % 8).
+template <int D>
+__device__ __forceinline__ int swz(int r, int d) {
+    return r * D + ((((d >> 3) ^ r) & 7) | ((d >> 3) & ~7)) * 8 + (d & 7);
+}
+
+constexpr int BR = 64, BC = 64, D = 64, T = 128;
+constexpr int SMEM_HALVES = 2 * BC * D + (BR > 2 * BC ? BR : 2 * BC) * D;  // 2 K/V stages; Q borrows stage 1
+// -inf from its bit pattern: MSVC's INFINITY macro expands to 1e300*1e300, which nvcc flags with #221
+__device__ __forceinline__ float neg_inf() { return __int_as_float(0xff800000); }
+
+}  // namespace fa
+
+__global__ void __launch_bounds__(fa::T)
+flash_prefill_kernel(half* __restrict__ O, const half* __restrict__ Q,
+                     const half* __restrict__ K, const half* __restrict__ V,
+                     int seq_len, int kv_len, int num_q_heads, int num_kv_heads, float scale) {
+    using namespace fa;
+    constexpr int KD = D / 16, NS = BC / 8, NO = D / 8;
+
+    const int qh  = blockIdx.y;
+    const int kvh = qh / (num_q_heads / num_kv_heads);
+    const int q_stride  = num_q_heads * D;
+    const int kv_stride = num_kv_heads * D;
+    const int start = kv_len - seq_len;          // position of query row 0
+    Q += qh * D;  O += qh * D;  K += kvh * D;  V += kvh * D;
+
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    half* sKV = reinterpret_cast<half*>(smem_raw);
+    half* sQ  = sKV + 2 * BC * D;
+
+    const int tid = threadIdx.x, lane = tid & 31;
+    const int wr = (tid >> 5) * 16;               // this warp's first row in the tile
+    const int g = lane >> 2, t = lane & 3;        // accumulator row (and +8), column pair
+    const int i0 = blockIdx.x * BR;
+    // Causal tile skip: no row of this block sees past its last row's position
+    const int kv_end = min(kv_len, start + min(i0 + BR, seq_len));
+    const int pos0 = start + i0 + wr + g;         // positions of this thread's two rows
+    const int pos1 = pos0 + 8;
+
+    auto load_kv = [&](int j0, int st) {
+        half* sK = sKV + st * 2 * BC * D;
+        half* sV = sK + BC * D;
+        for (int c = tid; c < BC * D / 8; c += T) {
+            int b = c / (D / 8), d = c % (D / 8) * 8;
+            bool in = j0 + b < kv_end;
+            size_t src = (size_t)(in ? j0 + b : 0) * kv_stride + d;
+            cp_async16(sK + swz<D>(b, d), K + src, in);
+            cp_async16(sV + swz<D>(b, d), V + src, in);
+        }
+        cp_async_commit();
+    };
+
+    for (int c = tid; c < BR * D / 8; c += T) {
+        int r = c / (D / 8), d = c % (D / 8) * 8;
+        bool in = i0 + r < seq_len;
+        cp_async16(sQ + swz<D>(r, d), Q + (size_t)(in ? i0 + r : 0) * q_stride + d, in);
+    }
+    cp_async_commit();
+    load_kv(0, 0);
+    cp_async_wait<1>();   // Q is in; tile 0 may still be in flight
+    __syncthreads();
+
+    uint32_t qf[KD][4];
+    #pragma unroll
+    for (int kk = 0; kk < KD; ++kk)
+        ldsm_x4(qf[kk], sQ + swz<D>(wr + (lane & 15), kk * 16 + (lane >> 4) * 8));
+
+    float o[NO][4] = {};
+    float m[2] = { neg_inf(), neg_inf() };
+    float l[2] = { 0.0f, 0.0f };   // per-thread partial row sums, reduced at the end
+
+    for (int j0 = 0, st = 0; j0 < kv_end; j0 += BC, st ^= 1) {
+        __syncthreads();
+        if (j0 + BC < kv_end) load_kv(j0 + BC, st ^ 1);
+        else                  cp_async_commit();   // empty group keeps the wait count uniform
+        cp_async_wait<1>();
+        __syncthreads();
+        const half* sK = sKV + st * 2 * BC * D;
+        const half* sV = sK + BC * D;
+
+        // S = Q K^T
+        float s[NS][4] = {};
+        #pragma unroll
+        for (int kk = 0; kk < KD; ++kk) {
+            #pragma unroll
+            for (int nb = 0; nb < NS / 2; ++nb) {
+                uint32_t b[4];
+                ldsm_x4(b, sK + swz<D>(nb * 16 + (lane & 7) + (lane >> 4) * 8,
+                                       kk * 16 + ((lane >> 3) & 1) * 8));
+                mma16816(s[2 * nb],     qf[kk], b[0], b[1]);
+                mma16816(s[2 * nb + 1], qf[kk], b[2], b[3]);
+            }
+        }
+
+        // Causal mask + online softmax. s[n][0..1] is row g, s[n][2..3] row g+8.
+        // Column 0 is visible to every row, so m is finite after the first tile.
+        float mx[2] = { m[0], m[1] };
+        #pragma unroll
+        for (int n = 0; n < NS; ++n)
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                int col = j0 + n * 8 + 2 * t + (e & 1);
+                int pos = (e >> 1) ? pos1 : pos0;
+                s[n][e] = (col <= pos && col < kv_len) ? s[n][e] * scale : neg_inf();
+                mx[e >> 1] = fmaxf(mx[e >> 1], s[n][e]);
+            }
+        float alpha[2];
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffff, mx[i], 1));
+            mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffff, mx[i], 2));
+            alpha[i] = __expf(m[i] - mx[i]);
+            m[i] = mx[i];
+            l[i] *= alpha[i];
+        }
+        #pragma unroll
+        for (int n = 0; n < NS; ++n)
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                s[n][e] = __expf(s[n][e] - m[e >> 1]);
+                l[e >> 1] += s[n][e];
+            }
+        #pragma unroll
+        for (int n = 0; n < NO; ++n)
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) o[n][e] *= alpha[e >> 1];
+
+        // O += P V; the S accumulators of n-tiles 2k, 2k+1 are the A fragment for k-step k
+        #pragma unroll
+        for (int kk = 0; kk < BC / 16; ++kk) {
+            uint32_t a[4] = { pack_half2(s[2 * kk][0],     s[2 * kk][1]),
+                              pack_half2(s[2 * kk][2],     s[2 * kk][3]),
+                              pack_half2(s[2 * kk + 1][0], s[2 * kk + 1][1]),
+                              pack_half2(s[2 * kk + 1][2], s[2 * kk + 1][3]) };
+            #pragma unroll
+            for (int nb = 0; nb < NO / 2; ++nb) {
+                uint32_t b[4];
+                ldsm_x4_t(b, sV + swz<D>(kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8,
+                                         nb * 16 + (lane >> 4) * 8));
+                mma16816(o[2 * nb],     a, b[0], b[1]);
+                mma16816(o[2 * nb + 1], a, b[2], b[3]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        l[i] += __shfl_xor_sync(0xffffffff, l[i], 1);
+        l[i] += __shfl_xor_sync(0xffffffff, l[i], 2);
+    }
+    const int r0 = i0 + wr + g, r1 = r0 + 8;
+    const float inv0 = 1.0f / l[0], inv1 = 1.0f / l[1];
+    #pragma unroll
+    for (int n = 0; n < NO; ++n) {
+        int c = n * 8 + 2 * t;
+        if (r0 < seq_len) *reinterpret_cast<half2*>(O + (size_t)r0 * q_stride + c) = __floats2half2_rn(o[n][0] * inv0, o[n][1] * inv0);
+        if (r1 < seq_len) *reinterpret_cast<half2*>(O + (size_t)r1 * q_stride + c) = __floats2half2_rn(o[n][2] * inv1, o[n][3] * inv1);
+    }
+}
+
+bool flash_prefill_supported(int num_q_heads, int num_kv_heads, int head_dim) {
+    return head_dim == fa::D && num_q_heads % num_kv_heads == 0;
+}
+
+void launch_flash_prefill(half* out, const half* Q, const half* K, const half* V,
+                          int seq_len, int kv_len, int num_q_heads, int num_kv_heads,
+                          int head_dim, float scale) {
+    (void)head_dim;  // fixed by flash_prefill_supported
+    constexpr size_t smem = (size_t)fa::SMEM_HALVES * sizeof(half);  // 32 KB
+    dim3 grid(cdiv(seq_len, fa::BR), num_q_heads);
+    flash_prefill_kernel<<<grid, fa::T, smem>>>(out, Q, K, V, seq_len, kv_len,
+                                                num_q_heads, num_kv_heads, scale);
+}
+
 bool flash_decode_supported(int num_q_heads, int num_kv_heads, int head_dim) {
     return head_dim == FD_D && num_q_heads == FD_G * num_kv_heads && num_kv_heads <= FD_MAX_KV_HEADS;
 }

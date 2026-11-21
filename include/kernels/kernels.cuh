@@ -38,6 +38,9 @@ void launch_gemv(half* y, const half* x, const half* W, int N, int K);
 // --- M5: Attention ---
 void launch_attention_naive(half* out, const half* Q, const half* K, const half* V, int seq_len, int kv_len, int num_q_heads, int num_kv_heads, int head_dim, float scale);
 void launch_flash_attention_gqa(half* out, const half* Q, const half* K, const half* V, int seq_len, int kv_len, int num_q_heads, int num_kv_heads, int head_dim, float scale);
+// Tensor Core prefill attention (FlashAttention-lite v5 port), causal, GQA, head_dim 64.
+bool flash_prefill_supported(int num_q_heads, int num_kv_heads, int head_dim);
+void launch_flash_prefill(half* out, const half* Q, const half* K, const half* V, int seq_len, int kv_len, int num_q_heads, int num_kv_heads, int head_dim, float scale);
 // Split-KV decode attention (seq_len = 1): head_dim 64, 4 Q heads per KV head, <= 8 KV heads.
 bool flash_decode_supported(int num_q_heads, int num_kv_heads, int head_dim);
 void launch_flash_decode(half* out, const half* Q, const half* K, const half* V, int kv_len, int num_q_heads, int num_kv_heads, int head_dim, float scale);

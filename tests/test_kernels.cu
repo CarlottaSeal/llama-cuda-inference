@@ -1274,6 +1274,63 @@ bool test_flash_decode() {
     return true;
 }
 
+bool test_flash_prefill() {
+    printf("Testing Tensor Core prefill attention... ");
+
+    // {seq_len, start_pos}: short prompt, one exact block, a block + 1 row,
+    // ragged, and chunked prefill where queries start partway into the cache.
+    const int NQH = 32, NKVH = 8, HD = 64;
+    const float SCALE = 1.0f / sqrtf((float)HD);
+    const int cases[][2] = { {6, 0}, {64, 0}, {65, 0}, {100, 0}, {130, 37}, {200, 300}, {513, 0} };
+    TEST_ASSERT(flash_prefill_supported(NQH, NKVH, HD), "prefill shape not supported");
+
+    float worst = 0.0f;
+    for (const auto& cs : cases) {
+        const int S = cs[0], KV = cs[0] + cs[1];
+        const size_t q_n = (size_t)S * NQH * HD, kv_n = (size_t)KV * NKVH * HD;
+        std::vector<float> h_Q(q_n), h_K(kv_n), h_V(kv_n);
+        for (size_t i = 0; i < q_n; i++)  h_Q[i] = (int)((i * 37 + 11) % 401) * 0.005f - 1.0f;
+        for (size_t i = 0; i < kv_n; i++) h_K[i] = (int)((i * 53 + 7) % 397) * 0.005f - 1.0f;
+        for (size_t i = 0; i < kv_n; i++) h_V[i] = (int)((i * 29 + 3) % 389) * 0.005f - 1.0f;
+        auto h_Q_h = to_half(h_Q), h_K_h = to_half(h_K), h_V_h = to_half(h_V);
+
+        std::vector<float> ref(q_n);
+        cpu_attention(ref, to_float(h_Q_h), to_float(h_K_h), to_float(h_V_h),
+                      S, KV, NQH, NKVH, HD, SCALE);
+
+        half *d_Q, *d_K, *d_V, *d_O;
+        CUDA_CHECK(cudaMalloc(&d_Q, q_n * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_K, kv_n * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_V, kv_n * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_O, q_n * sizeof(half)));
+        CUDA_CHECK(cudaMemcpy(d_Q, h_Q_h.data(), q_n * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_K, h_K_h.data(), kv_n * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_V, h_V_h.data(), kv_n * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemset(d_O, 0xff, q_n * sizeof(half)));  // NaN: catches unwritten rows
+
+        launch_flash_prefill(d_O, d_Q, d_K, d_V, S, KV, NQH, NKVH, HD, SCALE);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<half> h_O(q_n);
+        CUDA_CHECK(cudaMemcpy(h_O.data(), d_O, q_n * sizeof(half), cudaMemcpyDeviceToHost));
+        cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O);
+
+        for (size_t i = 0; i < q_n; i++) {
+            float got = __half2float(h_O[i]);
+            float err = fabsf(got - ref[i]);
+            // P is rounded to FP16 before the P·V mma, as in FlashAttention-2
+            if (!(err <= 5e-3f + fabsf(ref[i]) * 5e-3f)) {
+                fprintf(stderr, "  S=%d KV=%d mismatch at row %zu dim %zu: got %f, expected %f\n",
+                        S, KV, i / (NQH * HD), i % HD, got, ref[i]);
+                return false;
+            }
+            worst = fmaxf(worst, err);
+        }
+    }
+
+    printf("PASSED (max abs err %.2e)\n", worst);
+    return true;
+}
+
 int main() {
     printf("=== Kernel Unit Tests ===\n\n");
 
@@ -1312,6 +1369,7 @@ int main() {
     run(test_attention_naive, "Attention Naive");
     run(test_flash_attention, "Flash Attention");
     run(test_flash_decode,    "Split-KV decode attention");
+    run(test_flash_prefill,   "Tensor Core prefill attention");
 
     printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);
     return (failed > 0) ? 1 : 0;
